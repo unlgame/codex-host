@@ -10,6 +10,7 @@ import {
   type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { sanitizeDiagnosticTail } from "@codexhost/harness-adapter";
+import { commandInvocation } from "@codexhost/harness-discovery";
 import type { HarnessAccountSnapshot, HarnessThinkingOptionId } from "@codexhost/shared-contracts";
 import { projectClaudeAccountUsage } from "./account-usage.js";
 
@@ -970,13 +971,15 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   }
 
   #spawn(options: SpawnOptions): ChildProcessWithoutNullStreams {
-    const child = spawn(options.command, options.args, {
+    const invocation = commandInvocation(options.command, options.args, options.env);
+    const child = spawn(invocation.command, invocation.arguments, {
       cwd: options.cwd,
       env: options.env,
       signal: options.signal,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       detached: process.platform !== "win32",
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
     });
     child.stderr.on("data", (chunk: Buffer | string) => {
       this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk.toString()}`);
@@ -1107,7 +1110,8 @@ export class ClaudeSdkModelInspector implements ClaudeModelInspector {
   }
 
   #spawn(options: SpawnOptions): ChildProcessWithoutNullStreams {
-    const child = spawn(options.command, options.args, {
+    const invocation = commandInvocation(options.command, options.args, options.env);
+    const child = spawn(invocation.command, invocation.arguments, {
       cwd: options.cwd,
       env: options.env,
       signal: options.signal,

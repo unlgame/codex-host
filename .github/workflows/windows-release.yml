@@ -1,0 +1,115 @@
+name: Windows x64 installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to attach the installer to (for example, v0.9.1)"
+        required: true
+        default: v0.9.1
+        type: string
+      publish:
+        description: "Attach the installer to a GitHub Release"
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the GitHub Release as a pre-release"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-${{ github.ref_name }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build windows-x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 75
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Setup npm
+        run: npm install --global npm@11.8.0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript prerequisites
+        run: npm run build:typescript
+
+      - name: Package windows-x64 installer
+        run: npm run release:package -- --target windows-x64
+
+      - name: Resolve artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          path="build/release/${version}/windows-x64/codexhost-${version}-windows-x64.exe"
+          if [[ ! -s "$path" ]]; then
+            echo "expected installer at ${path}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "path=${path}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codexhost-windows-x64
+          path: ${{ steps.artifact.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: inputs.publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          ARTIFACT: ${{ steps.artifact.outputs.path }}
+          VERSION: ${{ steps.artifact.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$PRERELEASE" == "true" ]]; then
+            create_flags=(--prerelease)
+          else
+            create_flags=(--latest)
+          fi
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARTIFACT" --clobber --repo "${{ github.repository }}"
+          else
+            gh release create "$TAG" "$ARTIFACT" \
+              --repo "${{ github.repository }}" \
+              --title "codexhost ${VERSION} windows-x64" \
+              --generate-notes \
+              "${create_flags[@]}"
+          fi

@@ -37,10 +37,14 @@ export const claudeCodeDiscoverySpec: HarnessDiscoverySpec = {
     ],
   },
   // Prefer Claude Code's native binary over the npm CMD shim beside it: the
-  // shim spawns an extra cmd.exe and loses signal handling.
+  // shim spawns an extra cmd.exe and loses signal handling. Only npm's global
+  // layout puts that binary in a different directory than the shim, though.
+  // Native installers and patched launchers (clawgod renames claude.exe away and
+  // leaves only claude.cmd) have no npm-layout sibling, and the shim itself is
+  // then the only runnable entry point, so it must stay a candidate.
   runnableCandidate: (candidate, { platform, isExecutable }) => {
     const pathFlavor = targetPath(platform);
-    if (platform !== "win32" || pathFlavor.basename(candidate).toLowerCase() !== "claude.cmd") {
+    if (platform !== "win32" || pathFlavor.extname(candidate).toLowerCase() !== ".cmd") {
       return candidate;
     }
     const native = pathFlavor.join(
@@ -48,7 +52,7 @@ export const claudeCodeDiscoverySpec: HarnessDiscoverySpec = {
       ...CLAUDE_NPM_PACKAGE_BIN.split("/"),
       "claude.exe",
     );
-    return isExecutable(native) ? native : undefined;
+    return isExecutable(native) ? native : candidate;
   },
 };
 

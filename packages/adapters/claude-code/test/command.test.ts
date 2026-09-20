@@ -59,15 +59,39 @@ describe("Claude Code executable resolution", () => {
     ).toBe(nativeExecutable);
   });
 
-  it("rejects a Windows npm shim without a native executable", () => {
-    const shim = String.raw`C:\tools\claude.cmd`;
+  it("falls back to a Windows CMD launcher when no native executable exists", () => {
+    // Patched installs (clawgod) rename claude.exe away and leave only the
+    // launcher, so the shim is the only runnable entry point.
+    const shim = String.raw`C:\Users\kkii\.local\bin\claude.cmd`;
 
-    expect(() =>
+    expect(
       resolveClaudeCodeExecutable(
         { command: shim, environment: {}, platform: "win32" },
         { isExecutable: (candidate) => candidate === shim },
       ),
-    ).toThrow("not installed");
+    ).toBe(shim);
+  });
+
+  it("still prefers the npm layout native executable over a launcher beside it", () => {
+    const directory = String.raw`C:\Users\test\.local\bin`;
+    const shim = path.win32.join(directory, "claude.cmd");
+    const nativeExecutable = path.win32.join(
+      directory,
+      "node_modules",
+      "@anthropic-ai",
+      "claude-code",
+      "bin",
+      "claude.exe",
+    );
+
+    expect(
+      resolveClaudeCodeExecutable(
+        { command: shim, environment: {}, platform: "win32" },
+        {
+          isExecutable: (candidate) => candidate === shim || candidate === nativeExecutable,
+        },
+      ),
+    ).toBe(nativeExecutable);
   });
 
   it("finds a user npm installation when a Finder-style PATH omits it", () => {

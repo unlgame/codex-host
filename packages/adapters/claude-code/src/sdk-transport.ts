@@ -45,6 +45,30 @@ const APPROVAL_DESCRIPTION_MAX_LENGTH = 500;
 const DEFAULT_ABORT_TIMEOUT_MS = 2_000;
 const INTERRUPT_TIMEOUT_MESSAGE = "Claude SDK interrupt timed out";
 
+/**
+ * Launch the Claude Code subprocess through the `cmd.exe` wrapper that
+ * `commandInvocation` builds for Windows `.cmd` launchers.
+ *
+ * `windowsVerbatimArguments` has to be forwarded verbatim: `commandInvocation`
+ * already produced a `cmd.exe /d /s /c` command line whose quoting only
+ * `cmd.exe` can interpret, and letting Node re-quote those arguments doubles the
+ * inner quotes. `cmd.exe` then fails to locate the launcher and the child exits
+ * with "The system cannot find the path specified", which surfaces as
+ * "Claude Code could not start".
+ */
+function spawnClaudeProcess(options: SpawnOptions): ChildProcessWithoutNullStreams {
+  const invocation = commandInvocation(options.command, options.args, options.env);
+  return spawn(invocation.command, invocation.arguments, {
+    cwd: options.cwd,
+    env: options.env,
+    signal: options.signal,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    detached: process.platform !== "win32",
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+  });
+}
+
 class PushableInput<T> implements AsyncIterable<T> {
   #closed = false;
   #queue: T[] = [];
@@ -971,16 +995,7 @@ export class ClaudeSdkTransport implements ClaudeTurnTransport {
   }
 
   #spawn(options: SpawnOptions): ChildProcessWithoutNullStreams {
-    const invocation = commandInvocation(options.command, options.args, options.env);
-    const child = spawn(invocation.command, invocation.arguments, {
-      cwd: options.cwd,
-      env: options.env,
-      signal: options.signal,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      detached: process.platform !== "win32",
-      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
-    });
+    const child = spawnClaudeProcess(options);
     child.stderr.on("data", (chunk: Buffer | string) => {
       this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk.toString()}`);
     });
@@ -1110,14 +1125,7 @@ export class ClaudeSdkModelInspector implements ClaudeModelInspector {
   }
 
   #spawn(options: SpawnOptions): ChildProcessWithoutNullStreams {
-    const invocation = commandInvocation(options.command, options.args, options.env);
-    const child = spawn(invocation.command, invocation.arguments, {
-      cwd: options.cwd,
-      env: options.env,
-      signal: options.signal,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
+    const child = spawnClaudeProcess(options);
     child.stderr.on("data", (chunk: Buffer | string) => {
       this.#stderrTail = sanitizeDiagnosticTail(`${this.#stderrTail}${chunk.toString()}`);
     });

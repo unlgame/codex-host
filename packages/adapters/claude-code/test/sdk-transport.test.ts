@@ -1,5 +1,7 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
@@ -1014,6 +1016,46 @@ describe("ClaudeSdkTransport root safety", () => {
     expect(allowsDangerouslySkipPermissions(() => 1000)).toBe(true);
     expect(allowsDangerouslySkipPermissions(undefined)).toBe(true);
   });
+});
+
+describe("ClaudeSdkTransport Windows launcher spawning", () => {
+  it.skipIf(process.platform !== "win32")(
+    "keeps the cmd.exe quoting intact for a patched .cmd launcher",
+    async () => {
+      const value = fixture();
+      const inspector = new ClaudeSdkModelInspector({
+        command: process.execPath,
+        cwd: process.cwd(),
+        closeTimeoutMs: 100,
+        queryFactory: value.queryFactory,
+      });
+      await inspector.inspect();
+      const spawnProcess = options(value).spawnClaudeCodeProcess;
+      if (!spawnProcess) throw new Error("Missing native process ownership hook");
+      const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "codexhost-launcher-"));
+      try {
+        const launcher = path.join(directory, "claude.cmd");
+        await fs.promises.writeFile(launcher, "@echo off\r\necho spawned> marker.txt\r\n", "utf8");
+        const child = spawnProcess({
+          command: launcher,
+          args: ["--version"],
+          signal: new AbortController().signal,
+          cwd: directory,
+          env: { ...process.env },
+        }) as ChildProcessWithoutNullStreams;
+        await once(child, "exit");
+        // cmd.exe only resolves the launcher when the already quoted command line
+        // reaches it verbatim; Node re-quoting it makes the child die with
+        // "The system cannot find the path specified" and no marker is written.
+        await expect(
+          fs.promises.readFile(path.join(directory, "marker.txt"), "utf8"),
+        ).resolves.toContain("spawned");
+      } finally {
+        await fs.promises.rm(directory, { recursive: true, force: true });
+      }
+      await inspector.close();
+    },
+  );
 });
 
 describe("ClaudeSdkTransport Model control", () => {

@@ -1,4 +1,5 @@
 import {
+  harnessIdSchema,
   harnessModelCatalogSchema,
   harnessModelRefSchema,
   harnessPermissionModeCatalogSchema,
@@ -1327,7 +1328,7 @@ describe("plugin route 建的线程也要能认出 Agent", () => {
     const thinkingOptionId = harnessThinkingOptionIdSchema.parse("high");
     const permissionModeId = harnessPermissionModeIdSchema.parse("default");
     const carrier = encodeHarnessPluginRoute({
-      harnessId: "pi",
+      harnessId: harnessIdSchema.parse("pi"),
       model,
       thinkingOptionId,
       permissionModeId,
@@ -1363,7 +1364,9 @@ describe("plugin route 建的线程也要能认出 Agent", () => {
   });
 
   it("plugin route 的 harnessId 与线程不符时仍然拒绝", () => {
-    const carrier = encodeHarnessPluginRoute({ harnessId: "qoder" });
+    const carrier = encodeHarnessPluginRoute({
+      harnessId: harnessIdSchema.parse("qoder"),
+    });
 
     expect(() =>
       restoredThreadOwnership({

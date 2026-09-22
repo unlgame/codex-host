@@ -20,6 +20,7 @@ import {
 import {
   DEFAULT_RENDERER_AGENTS,
   DraftAgentController,
+  KNOWN_RENDERER_AGENTS,
   type ComposerAgentPhase,
   type ExternalRendererAgent,
   type RendererAgent,
@@ -353,8 +354,58 @@ export function shouldPersistNewThreadConfigurationSelection(phase: ComposerAgen
   return phase === "draft";
 }
 
+/**
+ * 这些 Harness 在下面各有自己的 plugin route 分支（cursor-cli 会刻意丢掉
+ * thinking 之类），别被上面的通用分支抢走。
+ */
+const PLUGIN_ROUTE_OWNERSHIP_HARNESSES: ReadonlySet<string> = new Set([
+  "kiro-cli",
+  "codebuddy",
+  "workbuddy",
+  "cursor-cli",
+  "hermes",
+  "qoder",
+  "qoder-cn",
+]);
+
+function tryDecodePluginRoute(value: unknown): ReturnType<typeof decodeHarnessPluginRoute> {
+  try {
+    return decodeHarnessPluginRoute(value);
+  } catch {
+    return null;
+  }
+}
+
 export function restoredThreadOwnership(inspection: ThreadInspection): RestoredThreadOwnership {
   if (inspection.owner === "codex") return { agent: "codex" };
+
+  // 通用 plugin route（codexhost/plugin-v1@…）必须能解出来。
+  //
+  // 下面各 Harness 的原生解码只认自己的 `codexhost/<harness>-native@` 形式，
+  // 而 Thread 上存的 transportModelId 就是创建时那个 model 字符串的原样。桌面端
+  // 建线程时优先用原生形式（transportModelIdForHarness），但**其它客户端用的是
+  // 通用 plugin route**——它同样是 codex-host 自己产出的格式（没有原生编码的
+  // Harness 就是用它，见 protocol-core/model-routing.ts）。
+  //
+  // 少了这条分支，用 plugin route 建的线程在桌面端会显示「无法确认会话的
+  // Agent」，而且连消息都发不出去——ownershipError 会进 submissionBlocked。
+  if (!PLUGIN_ROUTE_OWNERSHIP_HARNESSES.has(inspection.harnessId)) {
+    const route = tryDecodePluginRoute(inspection.transportModelId);
+    if (route && route.harnessId === inspection.harnessId) {
+      const agent = KNOWN_RENDERER_AGENTS.find((known) => known === inspection.harnessId);
+      if (agent) {
+        const model = inspection.effectiveModel ?? route.model;
+        const thinkingOptionId = selectableThinkingOptionId(inspection) ?? route.thinkingOptionId;
+        const permissionModeId = inspection.effectivePermissionModeId ?? route.permissionModeId;
+        return {
+          agent,
+          ...(model ? { model } : {}),
+          ...(thinkingOptionId ? { thinkingOptionId } : {}),
+          ...(permissionModeId ? { permissionModeId } : {}),
+        };
+      }
+    }
+  }
   if (inspection.harnessId === "pi") {
     const transportSelection = decodePiTransportModelId(inspection.transportModelId);
     if (!transportSelection) {

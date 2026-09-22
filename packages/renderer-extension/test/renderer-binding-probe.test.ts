@@ -5,6 +5,7 @@ import {
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   decodeHarnessPluginRoute,
+  encodeHarnessPluginRoute,
 } from "@codexhost/shared-contracts";
 import { describe, expect, it, vi } from "vitest";
 import { modelSelectionForAgent } from "../src/versioned-renderer-adapter.js";
@@ -1311,5 +1312,67 @@ describe("Renderer Composer DOM behavior", () => {
     }
 
     expect(write).not.toHaveBeenCalled();
+  });
+});
+
+describe("plugin route 建的线程也要能认出 Agent", () => {
+  const history = { fork: false, forkAcrossCwd: false, rollbackLastTurn: false };
+
+  it("pi 线程用通用 plugin route 时不再变成 ownershipError", () => {
+    // 桌面端建 pi 线程时用原生形式（codexhost/pi-native@…），但**其它客户端**
+    // 用的是通用 plugin route。各 Harness 的原生解码只认自己的形式，少了
+    // plugin route 分支，这些线程在桌面端会显示「无法确认会话的 Agent」，
+    // 而且 submissionBlocked 会让消息根本发不出去。
+    const model = harnessModelRefSchema.parse({ id: "gpt-5.6-sol" });
+    const thinkingOptionId = harnessThinkingOptionIdSchema.parse("high");
+    const permissionModeId = harnessPermissionModeIdSchema.parse("default");
+    const carrier = encodeHarnessPluginRoute({
+      harnessId: "pi",
+      model,
+      thinkingOptionId,
+      permissionModeId,
+    });
+
+    expect(
+      restoredThreadOwnership({
+        owner: "external",
+        harnessId: "pi",
+        transportModelId: carrier,
+        effectiveModel: model,
+        effectiveThinkingOptionId: thinkingOptionId,
+        effectivePermissionModeId: permissionModeId,
+        locked: true,
+        history,
+      }),
+    ).toEqual({ agent: "pi", model, thinkingOptionId, permissionModeId });
+  });
+
+  it("原生形式的 pi 线程行为不变", () => {
+    const carrier = modelSelectionForAgent(null, null, "pi")?.model;
+    expect(carrier).toBeTruthy();
+
+    expect(
+      restoredThreadOwnership({
+        owner: "external",
+        harnessId: "pi",
+        transportModelId: String(carrier),
+        locked: true,
+        history,
+      }),
+    ).toMatchObject({ agent: "pi" });
+  });
+
+  it("plugin route 的 harnessId 与线程不符时仍然拒绝", () => {
+    const carrier = encodeHarnessPluginRoute({ harnessId: "qoder" });
+
+    expect(() =>
+      restoredThreadOwnership({
+        owner: "external",
+        harnessId: "pi",
+        transportModelId: carrier,
+        locked: true,
+        history,
+      }),
+    ).toThrow("incompatible");
   });
 });

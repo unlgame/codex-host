@@ -474,3 +474,90 @@ describe("ExternalThreadRuntime register", () => {
     },
   );
 });
+
+describe("ExternalThreadRuntime refresh", () => {
+  async function runtimeWithRepository(repository: unknown) {
+    const adapter = new FakeHarnessAdapter(harnessId);
+    const opened = await adapter.open({ kind: "create", cwd: "/synthetic" });
+    if (!opened.ok) throw new Error(opened.error.message);
+    const runtime = new ExternalThreadRuntime({
+      adapters: new Map([["pi", adapter]]),
+      repository: repository as ExternalThreadRepository,
+      consumeOutputs: async () => undefined,
+      diagnose: () => undefined,
+    });
+    return { runtime, adapter, session: opened.value };
+  }
+
+  it("对齐前重读仓库里的 record，不拿内存里那份陈旧副本", async () => {
+    // 线程被别处（桌面端）延续过之后，仓库里已经有新的 Turn 映射，而内存里
+    // 这份副本并不知道。拿它去对齐，alignSnapshot 会给同一个 Native Turn
+    // 生成一个新的 hostTurnId，reconcileTurnMappings 随即以
+    //   MAPPING_CONFLICT "Native Turn maps to another Host Turn"
+    // 拒绝写入——症状是这类线程从此再也打不开。
+    const stale = record();
+    const latest = {
+      ...record(),
+      revision: 2,
+      turnMappings: [
+        {
+          hostTurnId: "host-turn-1",
+          nativeTurnRef: {
+            harnessId,
+            nativeSessionId: "native-1",
+            nativeTurnKey: "native-turn-1",
+            formatVersion: 1,
+          },
+        },
+      ],
+    } as unknown as StoredThreadRecordV1;
+
+    const alignSnapshot = vi.fn(async (base: StoredThreadRecordV1) => ({
+      record: base,
+      turns: [],
+    }));
+    const { runtime, adapter, session } = await runtimeWithRepository({
+      find: async () => latest,
+      alignSnapshot,
+    });
+    const thread = runtime.register({
+      record: stale,
+      session,
+      sessionId: hostThreadId,
+      thread: { id: hostThreadId },
+      turns: [],
+    });
+
+    await expect(runtime.refresh(thread)).resolves.toBeNull();
+
+    expect(alignSnapshot).toHaveBeenCalledTimes(1);
+    // 基准必须是仓库里那份，不是内存里的陈旧副本。
+    expect(alignSnapshot.mock.calls[0]?.[0]).toBe(latest);
+    expect(thread.record).toBe(latest);
+
+    await adapter.close();
+  });
+
+  it("失败时把真实原因带进错误消息，而不是一句笼统的 -32081", async () => {
+    const { runtime, adapter, session } = await runtimeWithRepository({
+      find: async () => record(),
+      alignSnapshot: async () => {
+        throw new Error("Native Turn maps to another Host Turn");
+      },
+    });
+    const thread = runtime.register({
+      record: record(),
+      session,
+      sessionId: hostThreadId,
+      thread: { id: hostThreadId },
+      turns: [],
+    });
+
+    const result = await runtime.refresh(thread);
+
+    expect(result?.code).toBe(-32081);
+    expect(result?.message).toContain("Native Turn maps to another Host Turn");
+
+    await adapter.close();
+  });
+});

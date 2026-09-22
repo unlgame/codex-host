@@ -444,7 +444,20 @@ export class ExternalThreadRuntime {
     const snapshot = await thread.session.readSnapshot();
     if (!snapshot.ok) return mapExternalThreadHarnessError(snapshot.error, "read");
     try {
-      const aligned = await this.#repository.alignSnapshot(thread.record, snapshot.value);
+      // 先重读仓库里的 record，别拿内存里那份去对齐。
+      //
+      // 线程被别处（例如桌面端）延续过之后，仓库里已经有新的 Turn 映射，而内存
+      // 里这份副本并不知道。alignSnapshot 于是会给同一个 Native Turn 生成一个新的
+      // hostTurnId，reconcileTurnMappings 随即以
+      //   MAPPING_CONFLICT "Native Turn maps to another Host Turn"
+      // 拒绝写入——症状是这类线程从此再也打不开，而下面那个 catch 又把异常压成
+      // 一句笼统的 -32081，看不出真实原因。
+      //
+      // #restore 一直是先读仓库再对齐的，这里补上同一件事，让 refresh 与 restore
+      // 用同一个基准。
+      const latest = await this.#repository.find(thread.record.hostThreadId);
+      const base = latest ?? thread.record;
+      const aligned = await this.#repository.alignSnapshot(base, snapshot.value);
       thread.record = aligned.record;
       thread.turns = aligned.turns;
       thread.historyHydrated = true;
@@ -455,8 +468,12 @@ export class ExternalThreadRuntime {
         running: thread.running,
       });
       return null;
-    } catch {
-      return { code: -32081, message: "External Thread history could not be persisted" };
+    } catch (error) {
+      // 把真实原因带出来。原来这里把所有异常压成同一句话，排查时只能靠猜。
+      return {
+        code: -32081,
+        message: `External Thread history could not be persisted: ${errorMessage(error)}`,
+      };
     }
   }
 

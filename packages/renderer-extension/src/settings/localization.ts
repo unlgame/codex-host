@@ -234,6 +234,8 @@ export interface RendererSettingsMessages {
   readonly updateCopyFailed: string;
   readonly updateDownloadFromReleases: string;
   readonly updateDownloadWindowsInstaller: string;
+  readonly updateStarCallout: string;
+  readonly updateStarLink: string;
   readonly aboutTagline: string;
   readonly aboutParagraphs: readonly string[];
   readonly aboutOpenSource: string;
@@ -247,7 +249,7 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   locale: "en",
   title: "Settings",
   close: "Close settings",
-  starOnGitHub: "Give us a Star~",
+  starOnGitHub: "Star to support",
   sectionsLabel: "Settings sections",
   generalSection: "General",
   otherSection: "Other",
@@ -421,7 +423,7 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   connectionOpenInstallation: "Show installation instructions",
   connectionOpenHarnessWeb: "Open DeepSeek Harness Web",
   connectionDeepSeekTestedVersions:
-    "Tested with DSH 0.1.2-rc.1, 0.1.5-rc.1 and 0.1.5-rc.2. Other versions may connect, but have not been verified.",
+    "Supported DSH versions: 0.1.2-rc.1, 0.1.5-rc.1, 0.1.5-rc.2, 0.1.5-rc.3, 0.1.7-rc.1 and 0.1.7-rc.2. Other versions may connect after native protocol checks, but are not listed as supported.",
   connectionInstall: "Install",
   connectionInstallDescription: "This Harness was not detected.",
   connectionErrorTitle: "Connection check failed",
@@ -486,6 +488,9 @@ const ENGLISH_MESSAGES: RendererSettingsMessages = Object.freeze({
   updateCopyFailed: "Copy failed",
   updateDownloadFromReleases: "Download from GitHub Releases",
   updateDownloadWindowsInstaller: "Download Windows installer",
+  updateStarCallout:
+    "If CodexHost has helped you, please Star it on GitHub. It means a lot to us 👉",
+  updateStarLink: "GitHub",
   aboutTagline: "Run Pi and other Harnesses in Codex Desktop",
   aboutParagraphs: Object.freeze([
     "We believe Codex Desktop offers the best desktop development experience available today.",
@@ -510,7 +515,7 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   locale: "zh-CN",
   title: "设置",
   close: "关闭设置",
-  starOnGitHub: "点个 Star~",
+  starOnGitHub: "Star 支持",
   sectionsLabel: "设置分类",
   generalSection: "通用",
   otherSection: "其他",
@@ -676,7 +681,7 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   connectionOpenInstallation: "查看安装指引",
   connectionOpenHarnessWeb: "打开 DeepSeek Harness Web",
   connectionDeepSeekTestedVersions:
-    "已在 DSH 0.1.2-rc.1、0.1.5-rc.1 和 0.1.5-rc.2 上测试。其他版本可以尝试连接，但尚未验证。",
+    "支持 DSH 版本：0.1.2-rc.1、0.1.5-rc.1、0.1.5-rc.2、0.1.5-rc.3、0.1.7-rc.1 和 0.1.7-rc.2。其他版本可以在通过原生协议检查后尝试连接，但尚未列入支持列表。",
   connectionInstall: "安装",
   connectionInstallDescription: "尚未检测到该 Harness。",
   connectionErrorTitle: "连接检查失败",
@@ -737,6 +742,8 @@ const CHINESE_MESSAGES: RendererSettingsMessages = Object.freeze({
   updateCopyFailed: "复制失败",
   updateDownloadFromReleases: "前往 GitHub Releases 下载",
   updateDownloadWindowsInstaller: "下载 Windows 安装包",
+  updateStarCallout: "如果 CodexHost 帮到了你，请在 GitHub 点个 Star，这对我们意义重大 👉",
+  updateStarLink: "GitHub",
   aboutTagline: "在 Codex Desktop 中运行 Pi 和其他 Harness",
   aboutParagraphs: Object.freeze([
     "我们认为 Codex Desktop 提供了目前最好的桌面开发交互体验。",

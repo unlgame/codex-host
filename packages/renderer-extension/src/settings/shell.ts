@@ -210,7 +210,7 @@ export function mountRendererSettingsShell(
   starLink.rel = "noopener noreferrer";
   starLink.setAttribute("aria-label", messages.starOnGitHub);
   starLink.title = messages.starOnGitHub;
-  starLink.append(createRendererSettingsIcon("star", 17));
+  starLink.append(createRendererSettingsIcon("github", 17));
   const starLabel = ownerDocument.createElement("span");
   starLabel.textContent = messages.starOnGitHub;
   starLink.append(starLabel);

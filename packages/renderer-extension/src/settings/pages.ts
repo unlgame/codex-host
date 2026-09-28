@@ -83,7 +83,7 @@ export const DEFAULT_RENDERER_SETTINGS_PAGE_IDS = [
 export type DefaultRendererSettingsPageId = (typeof DEFAULT_RENDERER_SETTINGS_PAGE_IDS)[number];
 
 export interface RendererUpdateClient {
-  checkUpdate(): Promise<UpdateCheckResult>;
+  checkUpdate(): Promise<UpdateCheckResult | null>;
   startUpdate(): Promise<UpdateStartResult>;
   readUpdateStatus(): Promise<UpdateStatusResult>;
 }
@@ -210,6 +210,24 @@ function aboutPage(messages: RendererSettingsMessages): RendererSettingsPageDefi
   });
 }
 
+function updateStarBanner(document: Document, messages: RendererSettingsMessages): HTMLElement {
+  const banner = document.createElement("div");
+  banner.className = "settings-update-star";
+  const copy = document.createElement("p");
+  copy.className = "settings-update-star__copy";
+  copy.textContent = messages.updateStarCallout;
+  const link = document.createElement("a");
+  link.className = "settings-update-link settings-update-star__link";
+  link.href = CODEXHOST_GITHUB_REPOSITORY_URL;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  const star = createRendererSettingsIcon("star", 14);
+  star.classList.add("settings-update-star__mark");
+  link.append(createRendererSettingsIcon("github", 15), messages.updateStarLink, star);
+  banner.append(copy, link);
+  return banner;
+}
+
 function updatesPage(
   messages: RendererSettingsMessages,
   getClient: () => RendererUpdateClient | null,
@@ -327,11 +345,13 @@ function updatesPage(
       controls.append(manualTitle, manualNpm, manualWindowsInstaller, actions);
 
       // Release notes render below the fold, in the page scroller rather than a
-      // nested one.
+      // nested one. The Star banner stays above them so it remains visible
+      // without scrolling past the notes.
       const notes = document.createElement("div");
       notes.className = "settings-update-notes-section";
+      const starBanner = updateStarBanner(document, messages);
 
-      context.content.append(heading, metadata, panel, controls, notes);
+      context.content.append(heading, metadata, panel, controls, starBanner, notes);
 
       // Presentation-only: emphasise the manual path once the automatic one has
       // visibly failed.
@@ -360,7 +380,20 @@ function updatesPage(
         }
       };
 
+      // Unavailable can follow a rendered check (Retry after an error), so it
+      // restores the metadata and manual controls to their unchecked state.
       const renderUnavailable = (detail: string): void => {
+        currentVersionValue.textContent = "-";
+        latestVersionValue.textContent = "-";
+        latestVersionValue.className = "";
+        installationValue.textContent = "-";
+        manualTitle.hidden = false;
+        manualNpm.hidden = true;
+        manualWindowsInstaller.hidden = true;
+        manualWindowsInstallerLink.href = CODEXHOST_RELEASES_LATEST_URL;
+        releaseLink.hidden = false;
+        releaseLink.href = CODEXHOST_RELEASES_LATEST_URL;
+        controls.className = "settings-update-controls";
         panel.dataset.updateState = "unavailable";
         delete panel.dataset.inline;
         panel.replaceChildren();
@@ -474,7 +507,14 @@ function updatesPage(
         );
       };
 
-      const renderCheck = (result: UpdateCheckResult, client: RendererUpdateClient): void => {
+      const renderCheck = (
+        result: UpdateCheckResult | null,
+        client: RendererUpdateClient,
+      ): void => {
+        if (result === null) {
+          renderUnavailable(messages.runtimeCapabilityNotInstalled);
+          return;
+        }
         currentVersionValue.textContent = `v${result.currentVersion}`;
         latestVersionValue.textContent = result.latestVersion ? `v${result.latestVersion}` : "-";
         latestVersionValue.className = result.updateAvailable

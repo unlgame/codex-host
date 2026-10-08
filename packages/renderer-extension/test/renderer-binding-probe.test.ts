@@ -3,12 +3,10 @@ import {
   harnessModelCatalogSchema,
   harnessModelRefSchema,
   encodeHarnessPluginRoute,
-  harnessIdSchema,
   harnessPermissionModeCatalogSchema,
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   decodeHarnessPluginRoute,
-  encodeHarnessPluginRoute,
 } from "@codexhost/shared-contracts";
 import { describe, expect, it, vi } from "vitest";
 import { modelSelectionForAgent } from "../src/versioned-renderer-adapter.js";
@@ -1568,6 +1566,6 @@ describe("plugin route 建的线程也要能认出 Agent", () => {
         locked: true,
         history,
       }),
-    ).toThrow("incompatible");
+    ).toThrow("Thread plugin identity mismatch");
   });
 });

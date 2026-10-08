@@ -5,7 +5,8 @@ import {
 } from "@codexhost/shared-contracts";
 
 import type { RendererAgent } from "./agent-selection-state.js";
-import { createRendererAgentIcon, RENDERER_AGENT_LABELS } from "./renderer-agent-icon.js";
+import type { HarnessPluginDescriptor } from "@codexhost/shared-contracts";
+import { createRendererAgentIcon, rendererAgentLabel } from "./renderer-agent-icon.js";
 import type { RendererModelClient } from "./renderer-model-client.js";
 import { RendererMethodUnavailableError } from "./renderer-request-sender.js";
 
@@ -113,7 +114,7 @@ export interface SidebarAgentIconRow {
   hostId(): string | null;
   threadId(): string | null;
   draftId(): string | null;
-  render(agent: Exclude<RendererAgent, "codex">): void;
+  render(agent: Exclude<RendererAgent, "codex">, plugin?: HarnessPluginDescriptor): void;
   clear(): void;
 }
 
@@ -132,22 +133,7 @@ export function rendererAgentForThreadOwnership(
   ownership: ThreadOwnership,
 ): Exclude<RendererAgent, "codex"> | null {
   if (ownership.owner === "codex") return null;
-  if (ownership.harnessId === "pi") return "pi";
-  if (ownership.harnessId === "claude-code") return "claude-code";
-  if (ownership.harnessId === "deepseek-harness") return "deepseek-harness";
-  if (ownership.harnessId === "opencode") return "opencode";
-  if (ownership.harnessId === "grok") return "grok";
-  if (ownership.harnessId === "omp") return "omp";
-  if (ownership.harnessId === "antigravity") return "antigravity";
-  if (ownership.harnessId === "kiro-cli") return "kiro-cli";
-  if (ownership.harnessId === "codebuddy") return "codebuddy";
-  if (ownership.harnessId === "workbuddy") return "workbuddy";
-  if (ownership.harnessId === "cursor-cli") return "cursor-cli";
-  if (ownership.harnessId === "hermes") return "hermes";
-  if (ownership.harnessId === "qoder") return "qoder";
-  if (ownership.harnessId === "qoder-cn") return "qoder-cn";
-  if (ownership.harnessId === "kimi-code") return "kimi-code";
-  return null;
+  return ownership.harnessId;
 }
 
 // Desktop wraps some titles (hover label, secondary line), so the title is not always a direct
@@ -183,7 +169,8 @@ class BrowserSidebarAgentIconRow implements SidebarAgentIconRow {
     return draftIdFromSidebarRowElement(this.element);
   }
 
-  render(agent: Exclude<RendererAgent, "codex">): void {
+  render(agent: Exclude<RendererAgent, "codex">, plugin?: HarnessPluginDescriptor): void {
+    const presentation = JSON.stringify([agent, plugin?.name, plugin?.icon, plugin?.iconStyle]);
     const titleTrigger = this.element.querySelector<HTMLElement>("[data-thread-title-trigger]");
     const title = titleTrigger?.querySelector<HTMLElement>("[data-thread-title]");
     if (!titleTrigger || !title) {
@@ -197,15 +184,17 @@ class BrowserSidebarAgentIconRow implements SidebarAgentIconRow {
     if (
       icons.length === 1 &&
       icons[0]?.nextElementSibling === anchor &&
-      icons[0].getAttribute(SIDEBAR_AGENT_ICON_ATTRIBUTE) === agent
+      icons[0].getAttribute(SIDEBAR_AGENT_ICON_ATTRIBUTE) === agent &&
+      icons[0].dataset.presentation === presentation
     ) {
       return;
     }
     this.clear();
 
-    const label = `${RENDERER_AGENT_LABELS[agent]} Agent`;
+    const label = `${rendererAgentLabel(agent, plugin)} Agent`;
     const marker = this.element.ownerDocument.createElement("span");
     marker.setAttribute(SIDEBAR_AGENT_ICON_ATTRIBUTE, agent);
+    marker.dataset.presentation = presentation;
     marker.setAttribute("role", "img");
     marker.setAttribute("aria-label", label);
     marker.title = label;
@@ -216,7 +205,7 @@ class BrowserSidebarAgentIconRow implements SidebarAgentIconRow {
     marker.style.height = "14px";
     marker.style.flex = "none";
     marker.style.pointerEvents = "none";
-    marker.append(createRendererAgentIcon(agent, 14, this.element.ownerDocument));
+    marker.append(createRendererAgentIcon(agent, 14, this.element.ownerDocument, plugin));
     anchor.before(marker);
   }
 
@@ -251,7 +240,23 @@ class BrowserSidebarAgentIconDom implements SidebarAgentIconDom {
   }
 
   observe(onChange: () => void): () => void {
-    const observer = new MutationObserver(onChange);
+    const observer = new MutationObserver((mutations) => {
+      if (
+        mutations.some((mutation) => {
+          if (mutation.type === "attributes") return true;
+          const target =
+            mutation.target instanceof Element ? mutation.target : mutation.target.parentElement;
+          if (target?.closest(SIDEBAR_THREAD_ROW_SELECTOR)) return true;
+          return [...mutation.addedNodes, ...mutation.removedNodes].some(
+            (node) =>
+              node instanceof Element &&
+              (node.matches(SIDEBAR_THREAD_ROW_SELECTOR) ||
+                node.querySelector(SIDEBAR_THREAD_ROW_SELECTOR)),
+          );
+        })
+      )
+        onChange();
+    });
     observer.observe(this.root, {
       attributes: true,
       attributeFilter: [SIDEBAR_THREAD_ID_ATTRIBUTE, SIDEBAR_THREAD_HOST_ID_ATTRIBUTE],
@@ -269,6 +274,7 @@ class BrowserSidebarAgentIconDom implements SidebarAgentIconDom {
 
 export function installRendererSidebarAgentIcons(options: {
   getClient(hostId: string): RendererModelClient | null;
+  getPlugin?(hostId: string, agent: string): HarnessPluginDescriptor | undefined;
   getLocalAgent?(input: {
     hostId: string;
     threadId: string | null;
@@ -292,7 +298,7 @@ export function installRendererSidebarAgentIcons(options: {
   const scheduleScan = (): void => {
     if (disposed || scanScheduled) return;
     scanScheduled = true;
-    queueMicrotask(scan);
+    requestAnimationFrame(scan);
   };
 
   const clearOwnershipRetry = (key: string): void => {
@@ -394,7 +400,7 @@ export function installRendererSidebarAgentIcons(options: {
           clearOwnershipRetry(key);
         }
         if (localAgent === "codex") row.clear();
-        else row.render(localAgent);
+        else row.render(localAgent, options.getPlugin?.(hostId, localAgent));
         continue;
       }
       if (!threadId.success) {
@@ -404,7 +410,7 @@ export function installRendererSidebarAgentIcons(options: {
       const key = ownershipKey(hostId, threadId.data);
       if (ownershipByThread.has(key)) {
         const agent = ownershipByThread.get(key);
-        if (agent) row.render(agent);
+        if (agent) row.render(agent, options.getPlugin?.(hostId, agent));
         else row.clear();
         continue;
       }

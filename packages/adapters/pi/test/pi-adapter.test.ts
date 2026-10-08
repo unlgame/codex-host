@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -31,7 +31,9 @@ import {
   type PiSubagentNode,
 } from "../src/pi-subagents.js";
 import type { PiSessionHistory } from "../src/pi-history.js";
+import type { PiUsageObservation } from "../src/pi-usage.js";
 import { encodePiModelRef } from "../src/pi-model-catalog.js";
+import type { PiNativeCommand } from "../src/pi-slash-commands.js";
 import {
   PiRpcFaultError,
   type PiAutonomousTurn,
@@ -48,6 +50,10 @@ class FakePiTransport implements PiTurnTransport {
   autonomousHandler: ((turn: PiAutonomousTurn) => void) | null = null;
   readonly setAutonomousTurnHandler = vi.fn((handler: (turn: PiAutonomousTurn) => void) => {
     this.autonomousHandler = handler;
+  });
+  usageHandler: ((observation: PiUsageObservation) => void) | null = null;
+  readonly setUsageHandler = vi.fn((handler: (observation: PiUsageObservation) => void) => {
+    this.usageHandler = handler;
   });
   state: PiSessionState = {
     sessionId: "pi-session-1",
@@ -78,9 +84,25 @@ class FakePiTransport implements PiTurnTransport {
     });
   });
   readonly start = vi.fn(async () => undefined);
+  readonly getCommands = vi.fn(async (): Promise<PiNativeCommand[]> => []);
+  readonly supportsFastMode = vi.fn(async () => false);
+  readonly selectFastMode = vi.fn(async (enabled: boolean) => {
+    this.state = { ...this.state, fast: enabled };
+    return this.state;
+  });
   readonly getAvailableModels = vi.fn(async () => [
-    { provider: "synthetic-provider", id: "synthetic-model", reasoning: true },
-    { provider: "synthetic-provider", id: "alternate-model", reasoning: false },
+    {
+      provider: "synthetic-provider",
+      id: "synthetic-model",
+      reasoning: true,
+      api: "openai-codex-responses",
+    },
+    {
+      provider: "synthetic-provider",
+      id: "alternate-model",
+      reasoning: false,
+      api: "openai-codex-responses",
+    },
   ]);
   readonly getAvailableThinkingLevels = vi.fn<() => Promise<HarnessThinkingOptionId[] | null>>(
     async () =>
@@ -111,6 +133,7 @@ class FakePiTransport implements PiTurnTransport {
   readonly selectModel = vi.fn(async (model: { provider: string; id: string }) => {
     this.state = {
       ...this.state,
+      fast: false,
       provider: model.provider,
       modelId: model.id,
       ...(model.id === "alternate-model"
@@ -348,10 +371,20 @@ function autonomousTurn(
   };
 }
 
+function isUsageMetering(output: HarnessOutput): boolean {
+  return (
+    output.kind === "event" &&
+    (output.event.type === "usage.request" || output.event.type === "usage.history")
+  );
+}
+
+/** Lifecycle assertions skip Host usage metering events, which have their own tests. */
 async function nextOutput(iterator: AsyncIterator<HarnessOutput>): Promise<HarnessOutput> {
-  const result = await iterator.next();
-  if (result.done) throw new Error("Harness output stream ended unexpectedly");
-  return result.value;
+  for (;;) {
+    const result = await iterator.next();
+    if (result.done) throw new Error("Harness output stream ended unexpectedly");
+    if (!isUsageMetering(result.value)) return result.value;
+  }
 }
 
 async function nextEvent(iterator: AsyncIterator<HarnessOutput>) {
@@ -625,6 +658,180 @@ describe("Pi HarnessAdapter Session", () => {
     await adapter.close();
   });
 
+  it.each([false, true])("supports alias Fast (uncached cwd: %s)", async (liveSelection) => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "pi-fast-adapter-"));
+    await mkdir(path.join(home, ".pi/agent"), { recursive: true });
+    await mkdir(path.join(home, ".codex"));
+    const claims = Buffer.from(
+      JSON.stringify({ iss: "https://auth.openai.com", client_id: "app_EMoamEEZ73f0CkXaXp7hrann" }),
+    ).toString("base64url");
+    await writeFile(
+      path.join(home, ".pi/agent/auth.json"),
+      JSON.stringify({
+        "synthetic-provider": { type: "oauth", access: `header.${claims}.signature` },
+      }),
+    );
+    await writeFile(
+      path.join(home, ".codex/models_cache.json"),
+      JSON.stringify({
+        models: [{ slug: "synthetic-model", service_tiers: [{ id: "priority" }] }],
+      }),
+    );
+    const transports: FakePiTransport[] = [];
+    const adapter = new PiAdapter(
+      { environment: { HOME: home } },
+      {
+        createTransport: () => {
+          const transport = new FakePiTransport();
+          transport.supportsFastMode.mockResolvedValue(true);
+          transport.getCommands.mockResolvedValue([
+            {
+              name: "codexhost-fast-mode",
+              description: "Internal Fast command",
+              source: "extension",
+            },
+          ]);
+          transports.push(transport);
+          return transport;
+        },
+      },
+    );
+    try {
+      const inspection = await adapter.inspect({ cwd: home });
+      if (inspection.status !== "ready") throw new Error("Inspection failed");
+      const base = encodePiModelRef({ provider: "synthetic-provider", id: "synthetic-model" });
+      const fast = inspection.catalog.models.find((model) => model.ref.id === base.id)?.fastModel;
+      if (!fast) throw new Error("Missing Fast choice");
+      expect(
+        inspection.catalog.models.find((model) => model.label.endsWith("alternate-model"))
+          ?.fastModel,
+      ).toBeUndefined();
+      await adapter.inspect({ cwd: home });
+      expect(transports).toHaveLength(1);
+      const opened = await adapter.open({
+        kind: "create",
+        cwd: liveSelection ? path.join(home, "uninspected-project") : home,
+        model: liveSelection ? base : fast,
+      });
+      if (!opened.ok) throw new Error("Create failed");
+      const session = opened.value;
+      await session.readSnapshot();
+      if (liveSelection) {
+        expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+          ok: true,
+        });
+      }
+      // Capability checks must reuse the running Session, not spawn an inspection process.
+      expect(transports).toHaveLength(2);
+      const snapshot = await session.readSnapshot();
+      expect(snapshot).toMatchObject({ ok: true, value: { state: { effectiveModel: fast } } });
+      const live = transports[1];
+      if (!live) throw new Error("Missing live transport");
+      expect(live.selectFastMode).toHaveBeenCalledWith(true);
+      expect(JSON.stringify(await session.commands?.list())).not.toContain("codexhost-fast-mode");
+      expect(live.selectModel).not.toHaveBeenCalled();
+      expect(await session.execute({ type: "model.select", model: base })).toMatchObject({
+        ok: true,
+      });
+      expect(live.selectFastMode).toHaveBeenLastCalledWith(false);
+      live.selectFastMode.mockClear();
+      if (liveSelection) {
+        live.supportsFastMode.mockResolvedValueOnce(false);
+        expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+          ok: false,
+        });
+        // A different workspace need not expose the Model advertised by the picker's catalog.
+        live.getAvailableModels.mockResolvedValueOnce([]);
+        expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+          ok: false,
+        });
+        expect(live.selectFastMode).not.toHaveBeenCalled();
+
+        let finishInspection!: () => void;
+        live.getAvailableModels.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishInspection = () => resolve([]);
+            }),
+        );
+        const selecting = session.execute({ type: "model.select", model: fast });
+        await vi.waitFor(() => expect(finishInspection).toBeDefined());
+        expect(await session.execute({ type: "model.select", model: base })).toMatchObject({
+          ok: false,
+          error: { code: "sessionBusy" },
+        });
+        finishInspection();
+        expect(await selecting).toMatchObject({ ok: false });
+        expect(transports).toHaveLength(2);
+      }
+      live.getAvailableThinkingLevels.mockRejectedValueOnce(new Error("Thinking discovery failed"));
+      expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+        ok: false,
+      });
+      expect(live.selectFastMode).not.toHaveBeenCalled();
+      expect(live.state.fast).toBe(false);
+      expect(await session.execute({ type: "model.select", model: fast })).toMatchObject({
+        ok: true,
+      });
+      expect(live.selectModel).not.toHaveBeenCalled();
+      expect(live.state.thinkingLevel).toBe("high");
+      const invalid = encodePiModelRef({
+        provider: "synthetic-provider",
+        id: "alternate-model",
+        fast: true,
+      });
+      expect(await session.execute({ type: "model.select", model: invalid })).toMatchObject({
+        ok: false,
+      });
+      expect(
+        await session.execute({
+          type: "model.select",
+          model: encodePiModelRef({ provider: "synthetic-provider", id: "alternate-model" }),
+        }),
+      ).toMatchObject({ ok: true });
+      expect(live.state.fast).toBe(false);
+      const resumed = await adapter.open({
+        kind: "resume",
+        cwd: home,
+        model: fast,
+        nativeRef: nativeSessionRefSchema.parse({
+          harnessId: "pi",
+          nativeSessionId: "pi-session-1",
+          locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+          formatVersion: 1,
+        }),
+      });
+      expect(resumed).toMatchObject({
+        ok: true,
+        value: { initialState: { effectiveModel: fast } },
+      });
+      await rm(path.join(home, ".codex/models_cache.json"));
+      await adapter.inspect({ cwd: home, refresh: true });
+      const restoredWithoutSupport = await adapter.open({
+        kind: "resume",
+        cwd: home,
+        model: fast,
+        nativeRef: nativeSessionRefSchema.parse({
+          harnessId: "pi",
+          nativeSessionId: "pi-session-1",
+          locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+          formatVersion: 1,
+        }),
+      });
+      expect(restoredWithoutSupport).toMatchObject({
+        ok: true,
+        value: { initialState: { effectiveModel: base } },
+      });
+      expect(await adapter.open({ kind: "create", cwd: home, model: fast })).toMatchObject({
+        ok: false,
+        error: { code: "unsupported" },
+      });
+    } finally {
+      await adapter.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
   it("caches successful inspection by cwd, coalesces requests, and honors refresh", async () => {
     const { adapter, dependencies } = fixture();
 
@@ -644,6 +851,34 @@ describe("Pi HarnessAdapter Session", () => {
     });
     await expect(adapter.inspect({ cwd: "/other" })).resolves.toMatchObject({ status: "ready" });
     expect(dependencies.createTransport).toHaveBeenCalledTimes(3);
+    await adapter.close();
+  });
+
+  it("falls back inspect cwd when Host omits cwd or supplies the filesystem root", async () => {
+    const { adapter, dependencies } = fixture();
+    const cwdSpy = vi.spyOn(process, "cwd").mockReturnValue("/");
+
+    try {
+      await expect(adapter.inspect({ cwd: "/", refresh: true })).resolves.toMatchObject({
+        status: "ready",
+      });
+      await expect(adapter.inspect({ refresh: true })).resolves.toMatchObject({
+        status: "ready",
+      });
+    } finally {
+      cwdSpy.mockRestore();
+    }
+
+    const inspectCwds = vi
+      .mocked(dependencies.createTransport)
+      .mock.calls.map((call) => call[0]?.cwd);
+    expect(inspectCwds).toHaveLength(2);
+    for (const inspectCwd of inspectCwds) {
+      expect(inspectCwd).toEqual(expect.any(String));
+      expect(inspectCwd).not.toBe("/");
+      expect(path.resolve(inspectCwd as string)).not.toBe(path.parse(inspectCwd as string).root);
+      expect(path.isAbsolute(inspectCwd as string)).toBe(true);
+    }
     await adapter.close();
   });
 
@@ -1670,6 +1905,124 @@ describe("Pi HarnessAdapter Session", () => {
       outcome: { status: "failed", error: { message: "reasoning conflict" } },
     });
     await session.close();
+  });
+
+  it("declares an empty complete usage history for a created Session", async () => {
+    const { adapter } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    expect((await iterator.next()).value).toEqual({
+      kind: "event",
+      event: { type: "usage.history", complete: true },
+    });
+    await session.close();
+    await adapter.close();
+  });
+
+  it("replays every native request on resume, then meters live assistant messages", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    vi.mocked(dependencies.createTransport).mockImplementationOnce((options) => {
+      const transport = new FakePiTransport();
+      transport.options = options;
+      transport.history = {
+        leafId: "second",
+        entries: [
+          {
+            type: "message",
+            id: "first",
+            parentId: null,
+            message: {
+              role: "assistant",
+              model: "synthetic-model",
+              responseId: "resp-first",
+              usage: { input: 10, output: 2, cacheRead: 30, cacheWrite: 0 },
+            },
+          },
+          {
+            type: "message",
+            id: "second",
+            parentId: null,
+            message: {
+              role: "assistant",
+              model: "synthetic-model",
+              responseId: "resp-abandoned-branch",
+              usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+            },
+          },
+        ],
+      };
+      transports.push(transport);
+      return transport;
+    });
+    const opened = await adapter.open({
+      kind: "resume",
+      cwd: "/synthetic",
+      nativeRef: nativeSessionRefSchema.parse({
+        harnessId: "pi",
+        nativeSessionId: "pi-session-1",
+        locator: { sessionFile: "/synthetic/pi-session.jsonl" },
+        formatVersion: 1,
+      }),
+    });
+    if (!opened.ok) throw new Error(opened.error.message);
+    const iterator = opened.value.outputs[Symbol.asyncIterator]();
+    const events = [];
+    for (let index = 0; index < 3; index += 1) events.push((await iterator.next()).value);
+    expect(events).toEqual([
+      {
+        kind: "event",
+        event: {
+          type: "usage.request",
+          request: {
+            requestId: "resp-first",
+            historical: true,
+            model: "synthetic-model",
+            inputTokens: 40,
+            cachedInputTokens: 30,
+            cacheWriteInputTokens: 0,
+            outputTokens: 2,
+          },
+        },
+      },
+      {
+        kind: "event",
+        event: expect.objectContaining({
+          type: "usage.request",
+          request: expect.objectContaining({ requestId: "resp-abandoned-branch" }),
+        }),
+      },
+      { kind: "event", event: { type: "usage.history", complete: true } },
+    ]);
+
+    const transport = transports[0];
+    if (!transport?.usageHandler) throw new Error("Usage handler was not bound");
+    transport.usageHandler({
+      message: {
+        role: "assistant",
+        model: "synthetic-model",
+        responseId: "resp-live",
+        usage: { input: 1, output: 4, cacheRead: 0, cacheWrite: 0 },
+      },
+      startedAtMs: 100,
+      completedAtMs: 300,
+    });
+    transport.usageHandler({
+      message: { role: "assistant", responseId: "resp-broken" },
+      startedAtMs: null,
+      completedAtMs: 400,
+    });
+    expect((await iterator.next()).value).toMatchObject({
+      event: {
+        type: "usage.request",
+        request: { requestId: "resp-live", startedAtMs: 100, completedAtMs: 300 },
+      },
+    });
+    expect((await iterator.next()).value).toEqual({
+      kind: "event",
+      event: { type: "usage.history", complete: false },
+    });
+    await opened.value.close();
+    await adapter.close();
   });
 
   it("publishes Usage after the first Assistant message while the Turn remains active", async () => {

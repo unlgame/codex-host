@@ -1,3 +1,4 @@
+import type { ClaudeUsageRecord } from "./claude-usage.js";
 import type {
   HarnessAccountSnapshot,
   HarnessThinkingOptionId,
@@ -98,6 +99,10 @@ export type ClaudeTurnEvent =
       structuredResult?: JsonValue;
       isError: boolean;
       fileChange?: ClaudeNativeFileChange;
+      /** Native Bash moved the command to the background; it keeps running after this result. */
+      backgroundTaskId?: string;
+      /** Output file the backgrounded command streams to, named in the native result. */
+      backgroundOutputFile?: string;
     }
   | {
       type: "subagent.started";
@@ -126,12 +131,18 @@ export type ClaudeTurnEvent =
       nativeSubagentId?: string;
       resultSummary?: string;
     }
+  /**
+   * A native `task_notification`. Background Agents and background commands share
+   * it and it carries no task type: the Session routes it by `callId`.
+   */
   | {
       type: "subagent.settled";
       nativeSubagentId: string;
       callId?: string;
       status: "completed" | "failed" | "interrupted";
       resultSummary?: string;
+      /** The task's native output file. */
+      outputFile?: string;
     }
   | { type: "subagent.transcript.changed"; callId: string }
   | { type: "interaction.requested"; request: ClaudeInteractionRequest }
@@ -140,6 +151,8 @@ export type ClaudeTurnEvent =
       requestId: string;
       reason: "responded" | "cancelled" | "superseded";
     }
+  /** One finished native model request, for Host usage metering. */
+  | { type: "usage.request"; record: ClaudeUsageRecord }
   | {
       type: "usage.result";
       totalCostUsd?: number;
@@ -167,30 +180,37 @@ export interface ClaudePlanLimitEvent {
   sevenDay?: ClaudePlanLimitWindow;
 }
 
-export interface ClaudeAutonomousTurn {
-  nativeTurnKey: string;
-  events: ClaudeTurnEvent[];
-  result: ClaudeTransportTurnResult;
-}
-
 export interface ClaudeIdleTurnHandler {
   onEvent(event: ClaudeTurnEvent): void;
   onTerminal(result: ClaudeTransportTurnResult): void;
 }
 
+/**
+ * A native Segment that no requested Turn owns, such as Claude answering a background task
+ * notification. `start` runs once, when the Segment first produces Root output or reaches its
+ * Terminal without any; the Segment's events and Terminal then follow live.
+ */
+export interface ClaudeAutonomousTurnHandler extends ClaudeIdleTurnHandler {
+  start(nativeTurnKey: string): void;
+}
+
 export interface ClaudeTurnTransport {
   readonly sessionId: string;
-  setAutonomousTurnHandler(handler: (turn: ClaudeAutonomousTurn) => void): void;
+  setAutonomousTurnHandler(handler: ClaudeAutonomousTurnHandler): void;
   setIdleTurnHandler(handler: ClaudeIdleTurnHandler | null): void;
   /**
-   * Receives settlements that have no preceding buffered Subagent lifecycle.
+   * Receives settlements that have no preceding unpublished Subagent lifecycle.
    * A task-notification Segment may never produce a Terminal, so independent
-   * settlements must not wait for Turn batching. Settlements that depend on a
-   * buffered creation/reactivation stay in that batch to preserve causal order.
-   * Without a Thread handler, settlements remain in the autonomous Turn batch.
+   * settlements must not wait for that Segment. Settlements that depend on an
+   * unpublished creation/reactivation wait with it to preserve causal order.
+   * Without a Thread handler, settlements wait until the Segment starts its autonomous Turn.
    */
   setThreadEventHandler(handler: ((event: ClaudeTurnEvent) => void) | null): void;
   setIdleLive(live: boolean): void;
+  /** Native background tasks of any type are still active on this process. */
+  hasBackgroundTasks(): boolean;
+  /** Requests a native stop; the task still settles through its `task_notification`. */
+  stopBackgroundTask(taskId: string): Promise<void>;
   start(): Promise<void>;
   getContextUsage(): Promise<ClaudeTransportContextUsage | null>;
   /** Live slash commands of the started native Session, when known. */
@@ -212,12 +232,18 @@ export interface ClaudeTurnTransport {
     userMessageId: string,
     onEvent: (event: ClaudeTurnEvent) => void,
   ): Promise<ClaudeTransportTurnResult>;
+  /**
+   * Rejects while a requested or autonomous Turn runs. A Segment that has not produced Root
+   * output yet belongs to no Turn: the requested Turn takes over its native stream, starting
+   * with the events that Segment still holds.
+   */
   runTurn(
     text: string,
     userMessageId: string,
     onEvent: (event: ClaudeTurnEvent) => void,
   ): Promise<ClaudeTransportTurnResult>;
   respondToInteraction(response: ClaudeInteractionResponse): Promise<void>;
+  /** Interrupts the running requested or autonomous Turn; its Terminal still follows. */
   abort(): Promise<void>;
   close(): Promise<void>;
 }
@@ -230,6 +256,8 @@ export interface ClaudeTransportFactoryInput {
   model?: string;
   thinkingOptionId: HarnessThinkingOptionId;
   permissionMode: ClaudePermissionMode;
+  /** Native prerequisite for a later live `bypassPermissions` selection. */
+  allowDangerouslySkipPermissions: boolean;
   onPermissionModeChanged(permissionMode: ClaudePermissionMode): void;
   onFault(error: unknown): void;
   onPlanLimit(planLimit: ClaudePlanLimitEvent): void;
@@ -247,6 +275,8 @@ export interface ClaudeModelInspectorFactoryInput {
 }
 
 export interface ClaudeAdapterDependencies {
+  /** Whether Claude Code accepts `bypassPermissions` in the Session environment. */
+  bypassPermissionsAvailable(environment?: NodeJS.ProcessEnv): boolean;
   createInspector(input: ClaudeModelInspectorFactoryInput): ClaudeModelInspector;
   createTransport(input: ClaudeTransportFactoryInput): ClaudeTurnTransport;
   deleteSession(input: { cwd: string; sessionId: string }): Promise<void>;
@@ -257,7 +287,8 @@ export interface ClaudeAdapterDependencies {
   }): Promise<{ sessionId: string }>;
   getSessionInfo(input: { sessionId: string }): Promise<{ cwd?: string } | undefined>;
   inspectInstallation(): void;
-  readSessionMessages(input: { cwd: string; sessionId: string }): Promise<unknown[]>;
+  /** Null means the native transcript is absent, not a successfully read empty history. */
+  readSessionMessages(input: { cwd: string; sessionId: string }): Promise<unknown[] | null>;
   readSubagentMessages(input: {
     cwd: string;
     sessionId: string;

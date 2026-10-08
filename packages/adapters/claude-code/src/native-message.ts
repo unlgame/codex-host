@@ -1,3 +1,4 @@
+import { claudeUsageRecord, isClaudeModelRequest } from "./claude-usage.js";
 import { jsonValueSchema } from "@codexhost/shared-contracts";
 
 import { parseClaudeNativeFileChange } from "./file-change.js";
@@ -10,7 +11,10 @@ import type {
 
 const ABORTED_TERMINALS = new Set(["aborted_streaming", "aborted_tools"]);
 const AUTHENTICATION_ERRORS = new Set(["authentication_failed", "oauth_org_not_allowed"]);
-const SUBAGENT_TOOLS = new Set(["Agent", "Task", "SendMessage"]);
+/** Tools whose native lifecycle is a Subagent, not a Host Tool Item. */
+export const CLAUDE_SUBAGENT_TOOLS = new Set(["Agent", "Task", "SendMessage"]);
+/** Native Bash running in the background names the file its output streams to. */
+const BACKGROUND_OUTPUT_FILE_PATTERN = /Output is being written to: (.+?\.output)\./u;
 const SUBAGENT_DESCRIPTION_LIMIT = 500;
 const SUBAGENT_SUMMARY_LIMIT = 2_000;
 
@@ -350,12 +354,14 @@ export function parseClaudeTaskNotification(
   if (status !== "completed" && status !== "failed" && status !== "interrupted") return null;
   const summary = content.match(/<summary>([\s\S]*?)<\/summary>/u)?.[1]?.trim();
   const callId = content.match(/<tool-use-id>([^<]+)<\/tool-use-id>/u)?.[1]?.trim();
+  const outputFile = content.match(/<output-file>([^<]+)<\/output-file>/u)?.[1]?.trim();
   return {
     type: "subagent.settled",
     nativeSubagentId: taskId,
     status,
     ...(callId ? { callId } : {}),
     ...(summary ? { resultSummary: summary.slice(0, SUBAGENT_SUMMARY_LIMIT) } : {}),
+    ...(outputFile ? { outputFile } : {}),
   };
 }
 
@@ -406,6 +412,13 @@ export class ClaudeNativeTurnAccumulator {
     this.#cancelRequested = true;
   }
 
+  #usageRequest: {
+    id: string;
+    model: string;
+    usage: unknown;
+    startedAtMs: number | null;
+  } | null = null;
+
   consume(message: unknown): ClaudeNativeMessageResult {
     if (this.#completed || !isRecord(message)) return { events: [] };
     const events: ClaudeNativeEvent[] = [];
@@ -427,7 +440,10 @@ export class ClaudeNativeTurnAccumulator {
     }
 
     if (message.type === "stream_event" && isRecord(message.event)) {
-      if (!nested) this.#consumeStreamEvent(message, events);
+      if (!nested) {
+        this.#observeUsage(message.event, events);
+        this.#consumeStreamEvent(message, events);
+      }
     } else if (message.type === "tool_progress") {
       this.#consumeToolProgress(message, events);
     }
@@ -445,6 +461,12 @@ export class ClaudeNativeTurnAccumulator {
     }
 
     if (message.type !== "result") return { events };
+    if (this.#usageRequest) {
+      // Cancellation/failure can end a request without message_stop. Its final usage is
+      // unknown: invalidate metering rather than silently publish a partial Session total.
+      this.#usageRequest = null;
+      events.push({ type: "usage.request", record: { kind: "missing" } });
+    }
     const usageEvent = parseResultUsageEvent(message);
     if (usageEvent) events.push(usageEvent);
     this.#completed = true;
@@ -546,12 +568,17 @@ export class ClaudeNativeTurnAccumulator {
       }
       const resultSummary = boundedString(message.summary, SUBAGENT_SUMMARY_LIMIT);
       const callId = boundedString(message.tool_use_id, SUBAGENT_DESCRIPTION_LIMIT);
+      const outputFile =
+        typeof message.output_file === "string" && message.output_file.length > 0
+          ? message.output_file
+          : undefined;
       events.push({
         type: "subagent.settled",
         nativeSubagentId: agentId,
         status,
         ...(callId ? { callId } : {}),
         ...(resultSummary ? { resultSummary } : {}),
+        ...(outputFile ? { outputFile } : {}),
       });
       return;
     }
@@ -601,6 +628,41 @@ export class ClaudeNativeTurnAccumulator {
         ...(description ? { description } : {}),
         ...(agentId ? { nativeSubagentId: agentId } : {}),
         ...(resultSummary ? { resultSummary } : {}),
+      });
+    }
+  }
+
+  /**
+   * Meters each root model request from the Anthropic stream: `message_start` names it and
+   * carries input and cache counts, the first `content_block_start` is its first output token,
+   * `message_delta` carries the final counts and `message_stop` completes it.
+   */
+  #observeUsage(event: Record<string, unknown>, events: ClaudeNativeEvent[]): void {
+    if (event.type === "message_start") {
+      const message = isRecord(event.message) ? event.message : null;
+      this.#usageRequest =
+        message &&
+        typeof message.id === "string" &&
+        message.id.length > 0 &&
+        isClaudeModelRequest(message.model)
+          ? { id: message.id, model: message.model, usage: message.usage, startedAtMs: null }
+          : null;
+      return;
+    }
+    const request = this.#usageRequest;
+    if (!request) return;
+    if (event.type === "content_block_start") {
+      request.startedAtMs ??= Date.now();
+    } else if (event.type === "message_delta" && isRecord(event.usage)) {
+      request.usage = { ...(isRecord(request.usage) ? request.usage : {}), ...event.usage };
+    } else if (event.type === "message_stop") {
+      this.#usageRequest = null;
+      events.push({
+        type: "usage.request",
+        record: claudeUsageRecord(request.id, request.model, request.usage, {
+          startedAtMs: request.startedAtMs,
+          completedAtMs: Date.now(),
+        }),
       });
     }
   }
@@ -716,7 +778,7 @@ export class ClaudeNativeTurnAccumulator {
         if (!ignoreKnownIds) this.#protocolConflict = true;
         continue;
       }
-      const subagent = SUBAGENT_TOOLS.has(block.name);
+      const subagent = CLAUDE_SUBAGENT_TOOLS.has(block.name);
       this.#tools.set(block.id, { name: block.name, subagent });
       if (subagent) {
         const prompt = subagentPrompt(argumentsResult.data);
@@ -817,6 +879,20 @@ export class ClaudeNativeTurnAccumulator {
         continue;
       }
       const fileChange = isError ? null : parseClaudeNativeFileChange(tool.name, nativeResult);
+      const backgroundTaskId =
+        tool.name === "Bash" &&
+        !isError &&
+        isRecord(nativeResult) &&
+        typeof nativeResult.backgroundTaskId === "string" &&
+        nativeResult.backgroundTaskId.length > 0
+          ? nativeResult.backgroundTaskId
+          : undefined;
+      const outputFile =
+        backgroundTaskId !== undefined
+          ? BACKGROUND_OUTPUT_FILE_PATTERN.exec(outputText ?? "")?.[1]
+          : undefined;
+      const backgroundOutputFile =
+        typeof outputFile === "string" && outputFile.length > 0 ? outputFile : undefined;
       events.push({
         type: "tool.completed",
         callId,
@@ -825,6 +901,8 @@ export class ClaudeNativeTurnAccumulator {
         ...(structuredResult?.success ? { structuredResult: structuredResult.data } : {}),
         isError,
         ...(fileChange ? { fileChange } : {}),
+        ...(backgroundTaskId ? { backgroundTaskId } : {}),
+        ...(backgroundOutputFile ? { backgroundOutputFile } : {}),
       });
     }
   }

@@ -4,7 +4,7 @@ import {
   type ThreadOwnershipListParams,
   type ThreadOwnershipListResult,
 } from "@codexhost/shared-contracts";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { RendererAgent } from "../src/agent-selection-state.js";
 import type { RendererModelClient } from "../src/renderer-model-client.js";
@@ -114,6 +114,7 @@ function clientWith(
 
 async function settle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
+  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 }
 
 function fiberRow(
@@ -150,6 +151,16 @@ function fiberRow(
 }
 
 describe("Renderer sidebar Agent ownership", () => {
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) =>
+      setTimeout(() => callback(performance.now()), 0),
+    );
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it("resolves the draft key separately from the Fiber conversation identity", () => {
     const attributes = {
       "data-app-action-sidebar-thread-row": "",
@@ -240,7 +251,7 @@ describe("Renderer sidebar Agent ownership", () => {
     }
   });
 
-  it("batches mounted rows and decorates only known external Agents", async () => {
+  it("batches mounted rows and decorates arbitrary external plugin identities", async () => {
     const rows = [
       new FakeRow("codex-thread"),
       new FakeRow("pi-thread"),
@@ -274,7 +285,7 @@ describe("Renderer sidebar Agent ownership", () => {
     expect(client.listThreadOwnership).toHaveBeenCalledWith({
       threadIds: ["codex-thread", "pi-thread", "claude-thread", "unknown-thread"],
     });
-    expect(rows.map((row) => row.agent)).toEqual([null, "pi", "claude-code", null]);
+    expect(rows.map((row) => row.agent)).toEqual([null, "pi", "claude-code", "future-agent"]);
     control.dispose();
   });
 
@@ -530,7 +541,7 @@ describe("Renderer sidebar Agent ownership", () => {
     }
   });
 
-  it("maps only known external Harness ownership to Renderer Agents", () => {
+  it("maps external Harness ownership without a static identity list", () => {
     expect(
       rendererAgentForThreadOwnership({
         threadId: "kiro-thread" as HostThreadId,
@@ -579,6 +590,6 @@ describe("Renderer sidebar Agent ownership", () => {
         owner: "external",
         harnessId: FUTURE_HARNESS_ID,
       }),
-    ).toBeNull();
+    ).toBe("future-agent");
   });
 });

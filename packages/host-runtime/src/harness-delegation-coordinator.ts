@@ -16,7 +16,12 @@ import {
   type JsonObject,
   type RoutedHarnessId,
 } from "@codexhost/protocol-core";
-import { harnessIdSchema, hostThreadIdSchema, hostTurnIdSchema } from "@codexhost/shared-contracts";
+import {
+  catalogModelForRef,
+  harnessIdSchema,
+  hostThreadIdSchema,
+  hostTurnIdSchema,
+} from "@codexhost/shared-contracts";
 
 import {
   DELEGATION_THREAD_ID_ENV,
@@ -71,8 +76,11 @@ function taskDigest(
     .digest("hex");
 }
 
-function statusFromThread(thread: ExternalThread): StoredDelegationRecordV1["status"] {
-  if (thread.running) return "running";
+function statusFromThread(
+  thread: ExternalThread,
+  busy: boolean,
+): StoredDelegationRecordV1["status"] {
+  if (busy) return "running";
   const last = thread.turns.at(-1);
   if (last?.status === "failed") return "failed";
   if (last?.status === "interrupted") return "interrupted";
@@ -123,6 +131,7 @@ export class HarnessDelegationCoordinator {
   readonly #listOfficial: (input: ThreadListInput) => Promise<DelegationThreadListResult>;
   readonly #officialThreadCwd: (threadId: string) => Promise<string | undefined>;
   readonly #activeOfficialParents: () => string[];
+  readonly #externalThreadBusy: (thread: ExternalThread) => boolean;
 
   constructor(input: {
     adapters: Map<ExternalHarnessId, HarnessAdapter>;
@@ -151,6 +160,7 @@ export class HarnessDelegationCoordinator {
     listOfficial(input: ThreadListInput): Promise<DelegationThreadListResult>;
     officialThreadCwd(threadId: string): Promise<string | undefined>;
     activeOfficialParents(): string[];
+    externalThreadBusy(thread: ExternalThread): boolean;
   }) {
     this.#adapters = input.adapters;
     this.#environment = input.environment;
@@ -167,6 +177,7 @@ export class HarnessDelegationCoordinator {
     this.#listOfficial = input.listOfficial;
     this.#officialThreadCwd = input.officialThreadCwd;
     this.#activeOfficialParents = input.activeOfficialParents;
+    this.#externalThreadBusy = input.externalThreadBusy;
   }
 
   async listHarnesses(): Promise<HarnessListResult> {
@@ -411,9 +422,11 @@ export class HarnessDelegationCoordinator {
     }
     const thread = resolution.thread;
     if (thread.record.subagent) {
-      throw new DelegationControlError("DELEGATION_FAILED", "Thread is read-only");
+      throw new DelegationControlError("DELEGATION_FAILED", "Thread is read-only", {
+        readOnly: true,
+      });
     }
-    if (thread.running || thread.activeTurnId) {
+    if (this.#externalThreadBusy(thread) || thread.activeTurnId) {
       throw new DelegationControlError("THREAD_BUSY", "Thread already has an active Turn");
     }
     const turnId = hostTurnIdSchema.parse(randomUUID());
@@ -474,7 +487,7 @@ export class HarnessDelegationCoordinator {
       throw new DelegationControlError("THREAD_NOT_FOUND", "Thread was not found");
     }
     const thread = resolution.thread;
-    if (!thread.running && !resolution.historyFresh) {
+    if (!this.#externalThreadBusy(thread) && !resolution.historyFresh) {
       const error = await this.#externalRuntime.refresh(thread);
       // A Harness that died cannot serve its native history, but the Host already
       // projected the terminal Turn. Report that Turn only while it is still the
@@ -493,12 +506,13 @@ export class HarnessDelegationCoordinator {
           thread.projectedTurns.get(thread.activeTurnId)?.projector.pendingTurn() ?? {},
         ]
       : thread.turns;
+    const busy = this.#externalThreadBusy(thread);
     const snapshot = projectDelegationThreadSnapshot({
       threadId: thread.id,
       harnessId: thread.harnessId,
       thread: thread.thread,
       turns,
-      running: thread.running,
+      running: busy,
       view: input.view,
       ...(input.cursor ? { cursor: input.cursor } : {}),
       ...(input.limit !== undefined ? { limit: input.limit } : {}),
@@ -506,8 +520,9 @@ export class HarnessDelegationCoordinator {
     const delegation = await this.#repository.getDelegationByChild(
       hostThreadIdSchema.parse(thread.id),
     );
-    if (delegation && delegation.status !== statusFromThread(thread)) {
-      await this.#repository.setDelegationStatus(delegation.delegationId, statusFromThread(thread));
+    const status = statusFromThread(thread, busy);
+    if (delegation && delegation.status !== status) {
+      await this.#repository.setDelegationStatus(delegation.delegationId, status);
     }
     return snapshot;
   }
@@ -587,16 +602,20 @@ export class HarnessDelegationCoordinator {
     };
   }
 
+  /** External and native Codex Threads that currently have an active Turn. */
+  activeThreadIds(): string[] {
+    const external = this.#externalRuntime
+      .values()
+      .filter((thread) => this.#externalThreadBusy(thread))
+      .map((thread) => thread.id);
+    return [...external, ...this.#activeOfficialParents()];
+  }
+
   async #resolveParent(explicit?: string): Promise<string> {
     if (explicit) return explicit;
     const environmentThreadId = this.#environment[DELEGATION_THREAD_ID_ENV];
     if (environmentThreadId) return environmentThreadId;
-    const external = this.#externalRuntime
-      .values()
-      .filter((thread) => thread.running)
-      .map((thread) => thread.id);
-    const official = this.#activeOfficialParents();
-    const active = [...external, ...official];
+    const active = this.activeThreadIds();
     const onlyActive = active.length === 1 ? active[0] : undefined;
     if (onlyActive) return onlyActive;
     throw new DelegationControlError(
@@ -625,12 +644,14 @@ export class HarnessDelegationCoordinator {
         "Harness does not support Model selection",
       );
     }
-    if (model && !inspection.catalog.models.some((candidate) => candidate.ref.id === model.id)) {
+    if (model && !catalogModelForRef(inspection.catalog, model)) {
       throw new DelegationControlError(
         "INVALID_ARGUMENT",
         "Model is unavailable for the target Harness",
         {
-          validModelIds: inspection.catalog.models.map((candidate) => candidate.ref.id),
+          validModelIds: inspection.catalog.models.flatMap((candidate) =>
+            candidate.fastModel ? [candidate.ref.id, candidate.fastModel.id] : [candidate.ref.id],
+          ),
         },
       );
     }
@@ -641,9 +662,7 @@ export class HarnessDelegationCoordinator {
         "Harness does not support Thinking selection",
       );
     }
-    const modelEntry = selectedModel
-      ? inspection.catalog.models.find((candidate) => candidate.ref.id === selectedModel.id)
-      : undefined;
+    const modelEntry = catalogModelForRef(inspection.catalog, selectedModel);
     const validThinkingOptionIds = modelEntry?.supportedThinkingOptionIds ?? [];
     if (!validThinkingOptionIds.includes(thinkingOptionId)) {
       throw new DelegationControlError(

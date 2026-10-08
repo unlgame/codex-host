@@ -1,3 +1,4 @@
+import type { RemoteConnectionsControl } from "./remote-connections-control.js";
 import type { LoadedSessionsClient } from "./settings/loaded-sessions-table.js";
 import { readCodexLocaleSettings, type CodexLocaleSettings } from "./codex-locale-adapter.js";
 import {
@@ -30,6 +31,7 @@ export interface RendererSettingsLifecycleOptions {
   getAccountClient?(): RendererCodexAccountClient | null;
   getSessionImportClient?(): RendererSessionImportClient | null;
   getLoadedSessionsClient?(): LoadedSessionsClient | null;
+  getRemoteConnections?(): RemoteConnectionsControl | null;
   openImportedThread?: RendererImportedThreadOpener;
   onLocaleChange?(locale: RendererSettingsLocale): void;
 }
@@ -77,13 +79,20 @@ export function installRendererSettingsLifecycle(
         if (!disposed && !signal.aborted) shell?.close();
       },
       options.getLoadedSessionsClient ?? (() => null),
+      options.getRemoteConnections ?? (() => null),
     );
-    const nextShell = installRendererSettingsShell(definitions, messages, ownerWindow.document);
+    const nextShell = installRendererSettingsShell(definitions, messages, ownerWindow.document, {
+      onOpenChange(open) {
+        trigger?.setSelected(open);
+      },
+    });
     const nextTrigger = installRendererSettingsRailTrigger({
       available: nextShell.supported,
       messages,
       ownerDocument: ownerWindow.document,
       onOpen(opener, pageId) {
+        // Like a native destination, the current page ignores repeat activation.
+        if (shell?.open) return;
         const generation = ++openGeneration;
         void refreshLocale().then(() => {
           if (disposed || generation !== openGeneration) return;

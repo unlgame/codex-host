@@ -76,15 +76,6 @@ export {
 export type { RendererDraftPrewarmPolicyStatus } from "./renderer-draft-prewarm-policy.js";
 
 export {
-  installGateBypass,
-  gateBypassScript,
-} from "./gate-bypass.js";
-export type {
-  GateBypassResult,
-  InstallGateBypassOptions,
-} from "./gate-bypass.js";
-
-export {
   parseDesktopControllerArguments,
   runDesktopController,
   serializeDesktopControllerReadiness,

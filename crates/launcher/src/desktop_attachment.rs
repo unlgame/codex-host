@@ -28,8 +28,6 @@ const ATTACHMENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 pub(super) struct RuntimeControl {
     pub(super) renderer_cdp_endpoint: String,
     pub(super) renderer_cdp_arguments: [OsString; 2],
-    pub(super) inspector_endpoint: String,
-    pub(super) inspector_arguments: Vec<OsString>,
     pub(super) attachment_port: u16,
     pub(super) nonce: String,
 }
@@ -37,21 +35,16 @@ pub(super) struct RuntimeControl {
 pub(super) fn allocate_runtime_control() -> Result<RuntimeControl, Box<dyn Error>> {
     let renderer_cdp = TcpListener::bind(("127.0.0.1", 0))?;
     let attachment = TcpListener::bind(("127.0.0.1", 0))?;
-    let inspector = TcpListener::bind(("127.0.0.1", 0))?;
     let renderer_cdp_port = renderer_cdp.local_addr()?.port();
     let attachment_port = attachment.local_addr()?.port();
-    let inspector_port = inspector.local_addr()?.port();
     drop(attachment);
     drop(renderer_cdp);
-    drop(inspector);
     Ok(RuntimeControl {
         renderer_cdp_endpoint: format!("http://127.0.0.1:{renderer_cdp_port}"),
         renderer_cdp_arguments: [
             OsString::from("--remote-debugging-address=127.0.0.1"),
             OsString::from(format!("--remote-debugging-port={renderer_cdp_port}")),
         ],
-        inspector_endpoint: format!("http://127.0.0.1:{inspector_port}"),
-        inspector_arguments: vec![OsString::from(format!("--inspect=127.0.0.1:{inspector_port}"))],
         attachment_port,
         nonce: random_nonce()?,
     })

@@ -3,6 +3,7 @@ import path from "node:path";
 import { openRendererLocalPage } from "./renderer-local-page.js";
 import { listCdpTargets } from "./cdp-client.js";
 import { remoteConnectionsExpression } from "./remote-connections-control.js";
+import { installGateBypass, type GateBypassResult } from "./gate-bypass.js";
 import { remoteConnectionsReplySchema } from "@codexhost/shared-contracts";
 
 import {
@@ -22,6 +23,7 @@ import {
 
 export interface DesktopControllerOptions {
   rendererCdpEndpoint: string;
+  inspectorEndpoint: string;
   rendererPath: string;
   attachmentPort: number;
   attachmentNonce: string;
@@ -46,6 +48,11 @@ export interface DesktopControllerDependencies {
     options: StartControllerAttachmentServerOptions,
   ): Promise<ControllerAttachmentServer>;
   ready(readiness: DesktopControllerReadiness): void;
+  /** Installs the startup gate bypass into the Electron main process. */
+  installGateBypass(options: {
+    inspectorEndpoint: string;
+    signal?: AbortSignal;
+  }): Promise<GateBypassResult>;
   /** Publishes Renderer integration state for the codexhost console. */
   publishStatus?(document: DesktopControllerStatusDocument): void;
   sleep(milliseconds: number): Promise<void>;
@@ -96,8 +103,13 @@ const defaultDependencies: DesktopControllerDependencies = {
   ready: (readiness) => {
     process.stdout.write(`${serializeDesktopControllerReadiness(readiness)}\n`);
   },
+  installGateBypass,
   publishStatus: createControllerStatusPublisher(),
-  sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+  sleep: (milliseconds) => {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    setTimeout(resolve, milliseconds);
+    return promise;
+  },
   monitorIntervalMs: 500,
 };
 
@@ -122,6 +134,7 @@ export function parseDesktopControllerArguments(
   arguments_: readonly string[],
 ): DesktopControllerOptions {
   let endpoint: string | undefined;
+  let inspectorEndpoint: string | undefined;
   let rendererPath: string | undefined;
   let attachmentPort: number | undefined;
   let attachmentNonce: string | undefined;
@@ -134,6 +147,15 @@ export function parseDesktopControllerArguments(
       }
       if (!value) throw new Error("--renderer-cdp-endpoint requires a value");
       endpoint = rendererCdpEndpoint(value);
+      index += 1;
+      continue;
+    }
+    if (argument === "--inspector-endpoint") {
+      if (inspectorEndpoint !== undefined) {
+        throw new Error("--inspector-endpoint may only be provided once");
+      }
+      if (!value) throw new Error("--inspector-endpoint requires a value");
+      inspectorEndpoint = rendererCdpEndpoint(value);
       index += 1;
       continue;
     }
@@ -171,11 +193,13 @@ export function parseDesktopControllerArguments(
     throw new Error(`unknown Desktop Controller option: ${argument}`);
   }
   if (endpoint === undefined) throw new Error("--renderer-cdp-endpoint is required");
+  if (inspectorEndpoint === undefined) throw new Error("--inspector-endpoint is required");
   if (rendererPath === undefined) throw new Error("--renderer is required");
   if (attachmentPort === undefined) throw new Error("--attachment-port is required");
   if (attachmentNonce === undefined) throw new Error("--attachment-nonce is required");
   return {
     rendererCdpEndpoint: endpoint,
+    inspectorEndpoint,
     rendererPath,
     attachmentPort,
     attachmentNonce,
@@ -323,6 +347,15 @@ export async function runDesktopController(
       state: "compatible",
       issues: [],
     });
+    const gateBypassPromise = dependencies
+      .installGateBypass({
+        inspectorEndpoint: options.inspectorEndpoint,
+        signal,
+      })
+      .then(
+        (result) => startupTrace("gate bypass", result),
+        (error) => startupTrace("gate bypass failed", error),
+      );
     await useSession(async () => {
       if (session) return;
       try {
@@ -346,6 +379,7 @@ export async function runDesktopController(
         }
       });
     }
+    await gateBypassPromise;
   } finally {
     await attachmentServer?.close();
     await operation;

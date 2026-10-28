@@ -507,6 +507,8 @@ fn desktop_controller_command(
         .arg(node_entrypoint_path(&options.desktop_controller))
         .arg("--renderer-cdp-endpoint")
         .arg(&control.renderer_cdp_endpoint)
+        .arg("--inspector-endpoint")
+        .arg(&control.inspector_endpoint)
         .arg("--renderer")
         .arg(&options.renderer_extension)
         .arg("--attachment-port")
@@ -733,8 +735,9 @@ fn supervise_desktop(
     descriptor_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
     startup_trace("launching Codex Desktop");
-    let desktop_arguments =
+    let mut desktop_arguments =
         desktop_path_overrides::launch_arguments(desktop_arguments, environment);
+    desktop_arguments.extend(control.inspector_arguments.iter().cloned());
     let mut desktop = launch_desktop_session(
         installation,
         &options.shim,
@@ -820,8 +823,9 @@ fn supervise_desktop(
     descriptor_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
     startup_trace("launching Codex Desktop");
-    let desktop_arguments =
+    let mut desktop_arguments =
         desktop_path_overrides::launch_arguments(desktop_arguments, environment);
+    desktop_arguments.extend(control.inspector_arguments.iter().cloned());
     let mut desktop = launch_desktop(
         installation,
         &options.shim,
@@ -946,6 +950,11 @@ fn desktop_environment(
     if env::var_os(STARTUP_TRACE_ENV).as_deref() == Some(std::ffi::OsStr::new("1")) {
         environment.push((OsString::from(STARTUP_TRACE_ENV), OsString::from("1")));
     }
+    // Disable the Desktop's built-in auto-updater (Sparkle/MSIX/store update
+    // checks) so a known-good Desktop version stays pinned. Codex Desktop
+    // reads CODEX_SPARKLE_ENABLED=false as an official opt-out across all
+    // updater backends (build-flavor `u` guard: env.CODEX_SPARKLE_ENABLED===`false`).
+    environment.push((OsString::from("CODEX_SPARKLE_ENABLED"), OsString::from("false")));
     // LaunchServices and AppX do not inherit the source launch version.
     // Runtime metadata readers validate it and use it only for source launches.
     if let Some(version) = env::var_os("CODEXHOST_DEV_VERSION") {
@@ -1643,8 +1652,10 @@ mod tests {
                 "--remote-debugging-address=127.0.0.1".into(),
                 "--remote-debugging-port=43123".into(),
             ],
+            inspector_endpoint: "http://127.0.0.1:43125".into(),
+            inspector_arguments: vec!["--inspect=127.0.0.1:43125".into()],
             attachment_port: 43124,
-            nonce: "0123456789abcdef0123456789abcdef".into(),
+            nonce: "00000000000000000000000000000000".into(),
         }
     }
 
@@ -1660,12 +1671,14 @@ mod tests {
                 "/opt/desktop-controller.mjs",
                 "--renderer-cdp-endpoint",
                 "http://127.0.0.1:43123",
+                "--inspector-endpoint",
+                "http://127.0.0.1:43125",
                 "--renderer",
                 "/opt/renderer-extension.js",
                 "--attachment-port",
                 "43124",
                 "--attachment-nonce",
-                "0123456789abcdef0123456789abcdef",
+                "00000000000000000000000000000000",
             ]
         );
 

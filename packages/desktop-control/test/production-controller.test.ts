@@ -15,6 +15,7 @@ const attachmentNonce = "0123456789abcdef0123456789abcdef";
 function controllerOptions() {
   return {
     rendererCdpEndpoint: "http://127.0.0.1:43123",
+    inspectorEndpoint: "http://127.0.0.1:43125",
     rendererPath: "/renderer.js",
     attachmentPort: 43124,
     attachmentNonce,
@@ -36,6 +37,8 @@ describe("production Desktop Controller", () => {
       parseDesktopControllerArguments([
         "--renderer-cdp-endpoint",
         "http://127.0.0.1:43123",
+        "--inspector-endpoint",
+        "http://127.0.0.1:43125",
         "--renderer",
         rendererPath,
         "--attachment-port",
@@ -45,6 +48,7 @@ describe("production Desktop Controller", () => {
       ]),
     ).toEqual({
       rendererCdpEndpoint: "http://127.0.0.1:43123",
+      inspectorEndpoint: "http://127.0.0.1:43125",
       rendererPath,
       attachmentPort: 43124,
       attachmentNonce,
@@ -126,6 +130,7 @@ describe("production Desktop Controller", () => {
       startAttachmentServer,
       ready,
       sleep: vi.fn(async () => {}),
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     };
 
@@ -183,6 +188,7 @@ describe("production Desktop Controller", () => {
       sleep: vi.fn(async () => {
         abort.abort();
       }),
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 
@@ -232,6 +238,7 @@ describe("production Desktop Controller", () => {
       startAttachmentServer: vi.fn(async () => attachmentServer()),
       ready,
       sleep,
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 
@@ -271,6 +278,7 @@ describe("production Desktop Controller", () => {
       ready,
       sleep,
       now: () => currentTime,
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 
@@ -295,6 +303,7 @@ describe("production Desktop Controller", () => {
       startAttachmentServer,
       ready,
       sleep: vi.fn(async () => {}),
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 
@@ -334,6 +343,7 @@ describe("production Desktop Controller", () => {
         if (install.mock.calls.length >= 2) abort.abort();
       }),
       now: () => currentTime,
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 
@@ -370,6 +380,7 @@ describe("production Desktop Controller", () => {
       startAttachmentServer,
       ready,
       sleep: vi.fn(async () => {}),
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 
@@ -410,6 +421,7 @@ describe("production Desktop Controller", () => {
       startAttachmentServer,
       ready: vi.fn(),
       sleep,
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 
@@ -459,6 +471,7 @@ describe("production Desktop Controller", () => {
       ready: vi.fn(),
       sleep,
       now: () => currentTime,
+      installGateBypass: vi.fn(async () => ({ installed: false, detail: "mock" })),
       monitorIntervalMs: 1,
     });
 

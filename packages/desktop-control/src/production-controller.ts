@@ -49,7 +49,7 @@ export interface DesktopControllerDependencies {
   ): Promise<ControllerAttachmentServer>;
   ready(readiness: DesktopControllerReadiness): void;
   /** Installs the startup gate bypass into the Electron main process. */
-  installGateBypass(options: {
+  installGateBypass?(options: {
     inspectorEndpoint: string;
     signal?: AbortSignal;
   }): Promise<GateBypassResult>;
@@ -347,15 +347,14 @@ export async function runDesktopController(
       state: "compatible",
       issues: [],
     });
-    const gateBypassPromise = dependencies
-      .installGateBypass({
-        inspectorEndpoint: options.inspectorEndpoint,
-        signal,
-      })
-      .then(
-        (result) => startupTrace("gate bypass", result),
-        (error) => startupTrace("gate bypass failed", error),
-      );
+    const gateBypass = dependencies.installGateBypass;
+    const gateBypassPromise =
+      options.inspectorEndpoint && gateBypass
+        ? gateBypass({ inspectorEndpoint: options.inspectorEndpoint, signal }).then(
+            (result) => startupTrace("gate bypass", result),
+            (error) => startupTrace("gate bypass failed", error),
+          )
+        : Promise.resolve();
     await useSession(async () => {
       if (session) return;
       try {

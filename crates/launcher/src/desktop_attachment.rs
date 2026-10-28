@@ -51,7 +51,7 @@ pub(super) fn allocate_runtime_control() -> Result<RuntimeControl, Box<dyn Error
             OsString::from(format!("--remote-debugging-port={renderer_cdp_port}")),
         ],
         inspector_endpoint: format!("http://127.0.0.1:{inspector_port}"),
-        inspector_arguments: vec![],
+        inspector_arguments: vec![OsString::from(format!("--inspect=127.0.0.1:{inspector_port}"))],
         attachment_port,
         nonce: random_nonce()?,
     })

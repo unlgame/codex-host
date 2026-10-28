@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
+  ModelInfo,
   OpenCodeClient,
   OpenCodeEvent,
   SessionInfo,
@@ -14,9 +15,10 @@ import {
 } from "@codexhost/harness-adapter";
 import { CodexTurnProjector } from "@codexhost/protocol-core";
 import { harnessModelCatalogSchema, hostTurnIdSchema } from "@codexhost/shared-contracts";
+import { encodeOpenCodeVariant } from "../src/model-catalog.js";
 import { openCodeMajor } from "../src/version.js";
 import { assistantItems, projectHistory, readMessages } from "../src/v2/history.js";
-import { v2Locator, v2Permissions, v2Ref } from "../src/v2/state.js";
+import { v2Catalog, v2Locator, v2Permissions, v2Ref, v2State } from "../src/v2/state.js";
 import { V2Session } from "../src/v2/session.js";
 import { v2UsageRequest } from "../src/v2/usage.js";
 import { formInteraction, replyInteraction } from "../src/v2/interactions.js";
@@ -156,6 +158,42 @@ describe("OpenCode protocol versions", () => {
     expect(v2Locator(ref)).toEqual({ directory: "/workspace", executionPolicy: "default" });
     expect(() => v2Locator({ ...ref, locator: { directory: "/workspace" } })).toThrow(
       "v2 Native Ref",
+    );
+  });
+});
+
+describe("OpenCode v2 Thinking state", () => {
+  const model = (id: string, variants: string[]) =>
+    ({
+      id,
+      providerID: "test",
+      name: id,
+      enabled: true,
+      variants: variants.map((variant) => ({ id: variant })),
+    }) as unknown as ModelInfo;
+  const stateFor = (variants: string[], variant: string | undefined) =>
+    v2State(
+      { ...info, model: { providerID: "test", id: "model", ...(variant ? { variant } : {}) } },
+      v2Catalog([model("model", variants)], null),
+      "default",
+    );
+
+  it("reads the native default variant as the catalog's Default option", () => {
+    const state = stateFor(["high", "low"], "default");
+    expect(state.effectiveThinkingOptionId).toBe(encodeOpenCodeVariant(undefined));
+    expect(state.availableThinkingOptions?.map((option) => option.id)).toContain(
+      state.effectiveThinkingOptionId,
+    );
+  });
+
+  it("keeps a variant the model itself names default", () => {
+    const state = stateFor(["default", "high"], "default");
+    expect(state.effectiveThinkingOptionId).toBe(encodeOpenCodeVariant("default"));
+  });
+
+  it("keeps an explicit variant's own option", () => {
+    expect(stateFor(["high", "low"], "high").effectiveThinkingOptionId).toBe(
+      encodeOpenCodeVariant("high"),
     );
   });
 });
@@ -596,6 +634,19 @@ describe("OpenCode v2 Session lifecycle", () => {
     expect(
       f.events.filter((e) => e.kind === "event" && e.event.type === "turn.started"),
     ).toHaveLength(1);
+  });
+  it("rejects turn.steer without submitting another prompt", async () => {
+    const f = fixture();
+    await f.start();
+    await f.turn();
+    const calls = f.prompt.mock.calls.length;
+    const steered = await f.session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("host-turn"),
+      input: [{ type: "text", text: "change direction" }],
+    });
+    expect(steered).toMatchObject({ ok: false, error: { code: "unsupported" } });
+    expect(f.prompt.mock.calls.length).toBe(calls);
   });
   it("closes the owned connection if rejected admission cannot be interrupted", async () => {
     const f = fixture();

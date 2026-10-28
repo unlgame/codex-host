@@ -1,3 +1,9 @@
+import {
+  createUsageStatisticsPage,
+  type RendererUsageStatisticsHostsProvider,
+  type RendererUsageStatisticsRequest,
+} from "../console/pages/usage-statistics.js";
+import { consoleMessages } from "../console/messages.js";
 import { createRemoteConnectionsPage } from "./remote-connections-page.js";
 import type { RemoteConnectionsControl } from "../remote-connections-control.js";
 import type {
@@ -78,6 +84,7 @@ export const DEFAULT_RENDERER_SETTINGS_PAGE_IDS = [
   "remote-connections",
   "accounts",
   "session-import",
+  "usage-statistics",
   "appearance",
   "updates",
   "about",
@@ -683,11 +690,14 @@ export function createDefaultRendererSettingsPages(
   getUpdateClient: () => RendererUpdateClient | null = () => null,
   getDiagnostics: () => RendererConnectionDiagnostics | null = () => null,
   getAccountClient: () => RendererCodexAccountClient | null = () => null,
-  getSessionImportClient: () => RendererSessionImportClient | null = () => null,
+  getSessionImportClient: (hostId?: string) => RendererSessionImportClient | null = () => null,
   openImportedThread: RendererImportedThreadOpener | null = () =>
     Promise.reject(new Error("Imported Thread navigation is unavailable")),
   getLoadedSessionsClient: () => LoadedSessionsClient | null = () => null,
   getRemoteConnections: () => RemoteConnectionsControl | null = () => null,
+  requestUsageStatistics: RendererUsageStatisticsRequest = () =>
+    Promise.reject(new Error("Local Host connection is unavailable")),
+  usageStatisticsHosts?: RendererUsageStatisticsHostsProvider,
 ): readonly RendererSettingsPageDefinition[] {
   return Object.freeze([
     createConnectionsSettingsPage(messages, getDiagnostics, undefined, getRemoteConnections),
@@ -698,6 +708,12 @@ export function createDefaultRendererSettingsPages(
       getSessionImportClient,
       openImportedThread,
       getDiagnostics,
+    ),
+    createUsageStatisticsPage(
+      consoleMessages(messages.locale),
+      requestUsageStatistics,
+      messages.locale,
+      usageStatisticsHosts,
     ),
     createAppearanceSettingsPage(messages, getLoadedSessionsClient),
     updatesPage(messages, getUpdateClient),
@@ -710,8 +726,10 @@ export function createDefaultRendererSettingsRegistry(
   getUpdateClient: () => RendererUpdateClient | null = () => null,
   getDiagnostics: () => RendererConnectionDiagnostics | null = () => null,
   getAccountClient: () => RendererCodexAccountClient | null = () => null,
-  getSessionImportClient: () => RendererSessionImportClient | null = () => null,
+  getSessionImportClient: (hostId?: string) => RendererSessionImportClient | null = () => null,
   openImportedThread?: RendererImportedThreadOpener,
+  requestUsageStatistics?: RendererUsageStatisticsRequest,
+  usageStatisticsHosts?: RendererUsageStatisticsHostsProvider,
 ): RendererSettingsPageRegistry {
   return createRendererSettingsPageRegistry(
     createDefaultRendererSettingsPages(
@@ -721,6 +739,10 @@ export function createDefaultRendererSettingsRegistry(
       getAccountClient,
       getSessionImportClient,
       openImportedThread,
+      undefined,
+      undefined,
+      requestUsageStatistics,
+      usageStatisticsHosts,
     ),
   );
 }

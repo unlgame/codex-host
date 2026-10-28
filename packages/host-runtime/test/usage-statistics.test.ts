@@ -1,4 +1,5 @@
-import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { appendFile, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,11 +9,20 @@ import type {
   HarnessUsageStatisticsCapability,
 } from "@codexhost/harness-adapter";
 import { FakeHarnessAdapter } from "@codexhost/harness-adapter/testing";
-import { harnessIdSchema, USAGE_STATISTICS_METHOD } from "@codexhost/shared-contracts";
+import { HarnessUsageSourceChangedError } from "@codexhost/harness-adapter/usage-statistics";
+import { createUsageStatisticsAdapter } from "@codexhost/adapter-codex-usage/plugin";
+import {
+  harnessIdSchema,
+  hostThreadIdSchema,
+  nativeSessionRefSchema,
+  USAGE_STATISTICS_METHOD,
+  usageStatisticsResultSchema,
+} from "@codexhost/shared-contracts";
 
 import { ModelPriceCatalog } from "../src/model-prices.js";
 import { UsageStatistics, usageEntryCostUsd } from "../src/usage-statistics.js";
-import { createFixture, stopFixture } from "./app-server-host-fixture.js";
+import type { UsageSessionTitleRecord } from "../src/usage-session-titles.js";
+import { createFixture, stopFixture, writeRequest } from "./app-server-host-fixture.js";
 
 const NOW = new Date(2026, 9, 5, 12).getTime();
 const DAY = 24 * 60 * 60 * 1000;
@@ -84,6 +94,122 @@ async function settledGet(stats: UsageStatistics, range: "today" | "7d" | "all" 
 }
 
 describe("UsageStatistics", () => {
+  it("retries an appended Codex rollout on first load and caches its fresh fingerprint", async () => {
+    let now = NOW;
+    const home = path.join(directory, "codex");
+    const sessions = path.join(home, "sessions");
+    await mkdir(sessions, { recursive: true });
+    const thread = "00000000-0000-4000-8000-000000000001";
+    const rollout = path.join(sessions, `rollout-2026-10-05T00-00-00-${thread}.jsonl`);
+    const row = (type: string, payload: unknown) =>
+      `${JSON.stringify({ timestamp: new Date(NOW).toISOString(), type, payload })}\n`;
+    await writeFile(
+      rollout,
+      row("session_meta", { id: thread }) +
+        row("turn_context", { model: "priced-model" }) +
+        row("token_usage_record", {
+          response_id: "first",
+          usage: { input_tokens: 100, output_tokens: 10 },
+        }),
+    );
+    const adapter = createUsageStatisticsAdapter({
+      environment: { CODEX_HOME: home },
+      platform: process.platform,
+      managedRemoteHost: false,
+    });
+    const native = adapter.usageStatistics;
+    let appended = false;
+    const readSource = vi.fn(async (id: string, signal: AbortSignal) => {
+      if (!appended) {
+        appended = true;
+        await appendFile(
+          rollout,
+          row("token_usage_record", {
+            response_id: "second",
+            usage: { input_tokens: 150, output_tokens: 20 },
+          }),
+        );
+      }
+      return native.readSource(id, signal);
+    });
+    const stats = new UsageStatistics({
+      directory: path.join(directory, "usage-statistics"),
+      prices: new ModelPriceCatalog({ directory }),
+      now: () => now,
+    });
+    stats.attach(() => [{ harness: "codex-usage", capability: { ...native, readSource } }]);
+    try {
+      const result = await settledGet(stats);
+      expect(result.failures).toEqual([]);
+      expect(result.reading).toEqual({ complete: true, sources: 1, read: 1 });
+      expect(result.totals).toMatchObject({ requests: 2, inputTokens: 250, outputTokens: 30 });
+      expect(readSource).toHaveBeenCalledTimes(2);
+      now += 11_000;
+      expect((await settledGet(stats)).failures).toEqual([]);
+      expect(readSource).toHaveBeenCalledTimes(2);
+    } finally {
+      stats.close();
+      await adapter.close();
+    }
+  });
+
+  it("bounds changed-source retries, retains prior entries, and reads stable sources once", async () => {
+    let now = NOW;
+    const storage = new FakeStorage(
+      new Map([
+        ["growing", { fingerprint: "1", entries: [entry("old")] }],
+        ["stable", { fingerprint: "1", entries: [entry("stable")] }],
+      ]),
+    );
+    const stats = new UsageStatistics({
+      directory,
+      prices: new ModelPriceCatalog({ directory }),
+      now: () => now,
+    });
+    stats.attach(() => [{ harness: "codex-usage", capability: storage }]);
+    await settledGet(stats);
+    storage.sources.set("growing", { fingerprint: "2", entries: [] });
+    // Installed plugins bundle separate copies of the public error class.
+    const changed = Object.assign(new Error("source keeps changing"), {
+      code: "HARNESS_USAGE_SOURCE_CHANGED",
+    });
+    const reads = vi.spyOn(storage, "readSource").mockImplementation(async () => {
+      throw changed;
+    });
+    const lists = vi.spyOn(storage, "listSources");
+    now += 11_000;
+    try {
+      const result = await settledGet(stats);
+      expect(reads.mock.calls.map(([id]) => id)).toEqual(["growing", "growing", "growing"]);
+      expect(lists).toHaveBeenCalledTimes(3);
+      expect(result.failures).toEqual([
+        { harness: "codex-usage", message: "source keeps changing" },
+      ]);
+      expect(result.totals.requests).toBe(2);
+      expect(result.reading).toEqual({ complete: true, sources: 2, read: 2 });
+    } finally {
+      stats.close();
+    }
+  });
+
+  it("cancels a pending changed-source retry when closed", async () => {
+    const storage = new FakeStorage(new Map([["one", { fingerprint: "1", entries: [] }]]));
+    const started = Promise.withResolvers<undefined>();
+    const read = vi.spyOn(storage, "readSource").mockImplementation(async () => {
+      started.resolve(undefined);
+      throw new HarnessUsageSourceChangedError("changed");
+    });
+    const listed = vi.spyOn(storage, "listSources");
+    const stats = statistics();
+    stats.attach(() => [{ harness: "codex-usage", capability: storage }]);
+    await stats.get("all");
+    await started.promise;
+    stats.close();
+    await stats.settled();
+    expect(listed).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledOnce();
+  });
+
   it("reports a subsequent scan as incomplete until it settles", async () => {
     let now = NOW;
     const storage = new FakeStorage(new Map());
@@ -414,7 +540,7 @@ describe("UsageStatistics", () => {
     stats.attach(() => [{ harness: "claude-code", capability: storage }]);
     const first = await settledGet(stats);
     expect(storage.reads).toEqual(["one", "two"]);
-    expect(await readdir(path.join(directory, "usage-statistics", "v6"))).toEqual([
+    expect(await readdir(path.join(directory, "usage-statistics", "v7"))).toEqual([
       "claude-code.json",
     ]);
 
@@ -437,7 +563,7 @@ describe("UsageStatistics", () => {
     const stats = statistics();
     stats.attach(() => [{ harness: "pi", capability: storage }]);
     const before = await settledGet(stats);
-    await writeFile(path.join(directory, "usage-statistics", "v6", "pi.json"), "{broken");
+    await writeFile(path.join(directory, "usage-statistics", "v7", "pi.json"), "{broken");
     const again = statistics();
     again.attach(() => [{ harness: "pi", capability: storage }]);
     expect((await settledGet(again)).totals).toEqual(before.totals);
@@ -489,6 +615,144 @@ describe("UsageStatistics", () => {
   });
 });
 
+it("uses persisted Desktop titles by Harness/native identity and reflects renames without reparsing", async () => {
+  const storage = new FakeStorage(
+    new Map([
+      [
+        "one",
+        {
+          fingerprint: "1",
+          entries: [
+            entry("mapped", {
+              sessionId: "native-session",
+              sessionTitle: "Raw first prompt",
+              cwd: "/project",
+            }),
+            entry("outside", {
+              sessionId: "unmapped-session",
+              sessionTitle: "Native title",
+              cwd: "/project",
+            }),
+          ],
+        },
+      ],
+    ]),
+  );
+  const adapter = Object.assign(new FakeHarnessAdapter(harnessIdSchema.parse("pi")), {
+    usageStatistics: storage,
+  });
+  const other = Object.assign(new FakeHarnessAdapter(harnessIdSchema.parse("omp")), {
+    usageStatistics: new FakeStorage(
+      new Map([
+        [
+          "one",
+          {
+            fingerprint: "1",
+            entries: [
+              entry("mapped", { sessionId: "native-session", sessionTitle: "Other Harness title" }),
+            ],
+          },
+        ],
+      ]),
+    ),
+  });
+  const usageStatistics = statistics();
+  const fixture = createFixture({
+    externalAdapters: new Map([
+      ["pi", adapter],
+      ["omp", other],
+    ]),
+    usageStatistics,
+  });
+  try {
+    await fixture.ready;
+    const record = await fixture.mappingStore.createProvisional({
+      hostThreadId: hostThreadIdSchema.parse(randomUUID()),
+      createRequestId: "usage-title-test",
+      harnessId: harnessIdSchema.parse("pi"),
+      cwd: "/project",
+      title: "理解项目背景",
+      transportModelId: "codexhost/pi-native",
+      ephemeral: false,
+      historyMode: "paginated",
+    });
+    await fixture.mappingStore.commitReady({
+      hostThreadId: record.hostThreadId,
+      nativeSessionRef: nativeSessionRefSchema.parse({
+        harnessId: "pi",
+        nativeSessionId: "native-session",
+        formatVersion: 1,
+      }),
+    });
+    await fixture.host.handleConsoleRequest(USAGE_STATISTICS_METHOD, { range: "all" });
+    await usageStatistics.settled();
+    const initial = await usageStatistics.get("all");
+    const expected = expect.arrayContaining([
+      expect.objectContaining({
+        harness: "pi",
+        sessionId: "native-session",
+        title: "理解项目背景",
+      }),
+      expect.objectContaining({
+        harness: "pi",
+        sessionId: "unmapped-session",
+        title: "Native title",
+      }),
+      expect.objectContaining({
+        harness: "omp",
+        sessionId: "native-session",
+        title: "Other Harness title",
+      }),
+    ]);
+    expect(initial.sessions).toEqual(expected);
+    expect(initial.recentSessions).toEqual(expected);
+    const reads = [...storage.reads];
+    // Exercise the real Desktop write path, not a statistics-only title mock.
+    writeRequest(fixture.desktopInput, {
+      id: 91,
+      method: "thread/name/set",
+      params: { threadId: record.hostThreadId, name: "新的会话标题" },
+    });
+    await fixture.collector.waitFor((message) => message.id === 91);
+    const renamed = await usageStatistics.get("all");
+    expect(renamed.sessions).toContainEqual(
+      expect.objectContaining({
+        harness: "pi",
+        sessionId: "native-session",
+        title: "新的会话标题",
+      }),
+    );
+    expect(renamed.recentSessions).toContainEqual(
+      expect.objectContaining({
+        harness: "pi",
+        sessionId: "native-session",
+        title: "新的会话标题",
+      }),
+    );
+    expect(renamed.totals).toEqual(initial.totals);
+    expect(storage.reads).toEqual(reads);
+    await fixture.mappingStore.setTitle(record.hostThreadId, "");
+    expect((await usageStatistics.get("all")).sessions).toContainEqual(
+      expect.objectContaining({
+        harness: "pi",
+        sessionId: "native-session",
+        title: "Raw first prompt",
+      }),
+    );
+    vi.spyOn(fixture.mappingStore, "listThreads").mockRejectedValueOnce(new Error("unavailable"));
+    expect((await usageStatistics.get("all")).sessions).toContainEqual(
+      expect.objectContaining({
+        harness: "pi",
+        sessionId: "native-session",
+        title: "Raw first prompt",
+      }),
+    );
+  } finally {
+    usageStatistics.close();
+    await stopFixture(fixture);
+  }
+});
+
 it("serves statistics through the Host from Adapters that expose local usage", async () => {
   const storage = new FakeStorage(new Map([["one", { fingerprint: "1", entries: [entry("a")] }]]));
   const adapter = Object.assign(new FakeHarnessAdapter(harnessIdSchema.parse("pi")), {
@@ -515,9 +779,135 @@ it("serves statistics through the Host from Adapters that expose local usage", a
     expect(
       await fixture.host.handleConsoleRequest(USAGE_STATISTICS_METHOD, { range: "1y" }),
     ).toMatchObject({ error: { code: -32602 } });
+    expect(
+      await fixture.host.handleConsoleRequest(USAGE_STATISTICS_METHOD, {
+        range: "today",
+        timeZone: "invalid/zone",
+      }),
+    ).toMatchObject({ error: { code: -32602 } });
+    await fixture.ready;
+    const params = { range: "today" as const, timeZone: "Asia/Shanghai" };
+    writeRequest(fixture.desktopInput, { id: 92, method: USAGE_STATISTICS_METHOD, params });
+    expect(await fixture.collector.waitFor((message) => message.id === 92)).toMatchObject({
+      result: await usageStatistics.get(params),
+    });
   } finally {
     usageStatistics.close();
     await stopFixture(fixture);
+  }
+});
+
+it.each(["native", "Desktop"])(
+  "returns schema-valid statistics for a long %s emoji title",
+  async (source) => {
+    const title = `${"a".repeat(199)}😀`;
+    const storage = new FakeStorage(
+      new Map([
+        [
+          "one",
+          {
+            fingerprint: "1",
+            entries: [
+              entry("r", {
+                sessionId: "s",
+                sessionTitle: source === "native" ? title : "Native title",
+              }),
+            ],
+          },
+        ],
+      ]),
+    );
+    const records: UsageSessionTitleRecord[] =
+      source === "Desktop"
+        ? [
+            {
+              harnessId: harnessIdSchema.parse("pi"),
+              nativeSessionRef: nativeSessionRefSchema.parse({
+                harnessId: "pi",
+                nativeSessionId: "s",
+                formatVersion: 1,
+              }),
+              state: "ready",
+              title,
+              updatedAt: new Date(NOW).toISOString(),
+            },
+          ]
+        : [];
+    const stats = statistics();
+    stats.attach(
+      () => [{ harness: "pi", capability: storage }],
+      async () => records,
+    );
+    try {
+      const result = await settledGet(stats);
+      expect(usageStatisticsResultSchema.safeParse(result).success).toBe(true);
+      expect(result.sessions[0]?.title).toBe(`${"a".repeat(199)}…`);
+      expect(result.recentSessions?.[0]?.title).toBe(`${"a".repeat(199)}…`);
+      expect(result.totals.requests).toBe(1);
+      if (source === "Desktop") expect(records[0]?.title).toBe(title);
+    } finally {
+      stats.close();
+    }
+  },
+);
+
+it("selects the latest named ready mapping and never borrows titles for a fork", async () => {
+  const storage = new FakeStorage(
+    new Map([
+      [
+        "one",
+        {
+          fingerprint: "1",
+          entries: [
+            entry("parent", { sessionId: "parent-session", sessionTitle: "Native parent" }),
+            entry("fork", { sessionId: "fork-session", sessionTitle: "Native fork" }),
+          ],
+        },
+      ],
+    ]),
+  );
+  const mapped = (title: string, updatedAt: string): UsageSessionTitleRecord => ({
+    harnessId: harnessIdSchema.parse("pi"),
+    nativeSessionRef: nativeSessionRefSchema.parse({
+      harnessId: "pi",
+      nativeSessionId: "parent-session",
+      formatVersion: 1,
+    }),
+    state: "ready",
+    title,
+    updatedAt,
+  });
+  let records = [
+    mapped("  最新\n标题  ", "2026-10-05T12:00:00Z"),
+    mapped("旧标题", "2026-10-04T12:00:00Z"),
+    mapped("   ", "2026-10-06T12:00:00Z"),
+    { ...mapped("未完成的标题", "2026-10-07T12:00:00Z"), state: "creating" as const },
+    { ...mapped("错配的标题", "2026-10-08T12:00:00Z"), harnessId: harnessIdSchema.parse("omp") },
+  ];
+  const stats = statistics();
+  stats.attach(
+    () => [{ harness: "pi", capability: storage }],
+    async () => records,
+  );
+  try {
+    const result = await settledGet(stats);
+    expect(result.sessions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionId: "parent-session", title: "最新 标题" }),
+        expect.objectContaining({ sessionId: "fork-session", title: "Native fork" }),
+      ]),
+    );
+    // Mapping deletion takes effect even when the native parse fingerprint has not changed.
+    records = [];
+    expect((await stats.get("all")).sessions).toContainEqual(
+      expect.objectContaining({
+        sessionId: "parent-session",
+        title: "Native parent",
+      }),
+    );
+    expect(storage.reads).toEqual(["one"]);
+  } finally {
+    stats.close();
   }
 });
 
@@ -625,5 +1015,39 @@ describe("UsageStatistics queries", () => {
     });
     // Requests without a session still count everywhere else.
     expect(result.totals.requests).toBe(4);
+  });
+
+  it("lists the latest sessions by last activity", async () => {
+    const stats = await seeded([
+      entry("old", { sessionId: "old", occurredAtMs: NOW - 5 * HOUR }),
+      entry("mid", { sessionId: "mid", occurredAtMs: NOW - HOUR }),
+      entry("new", { sessionId: "new", occurredAtMs: NOW }),
+      entry("orphan"),
+    ]);
+    const result = await stats.get({ range: "today" });
+    expect(result.recentSessions?.map((session) => session.sessionId)).toEqual([
+      "new",
+      "mid",
+      "old",
+    ]);
+    expect(result.recentSessions?.[0]).toMatchObject({
+      harness: "pi",
+      lastAtMs: NOW,
+      firstAtMs: NOW,
+      requests: 1,
+    });
+  });
+
+  it("keeps the native session title on listed sessions", async () => {
+    const stats = await seeded([
+      entry("a", { sessionId: "s1", sessionTitle: "Fix the login page" }),
+      entry("b", { sessionId: "s1", sessionTitle: "Login rewrite", occurredAtMs: NOW - HOUR }),
+    ]);
+    const result = await stats.get({ range: "today" });
+    expect(result.sessions[0]).toMatchObject({ sessionId: "s1", title: "Fix the login page" });
+    expect(result.recentSessions?.[0]).toMatchObject({
+      sessionId: "s1",
+      title: "Fix the login page",
+    });
   });
 });

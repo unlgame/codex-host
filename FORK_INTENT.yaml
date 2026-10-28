@@ -1,0 +1,50 @@
+version: 1
+intent: >
+  Windows-first distribution fork of BytePioneer-AI/codex-host. The fork keeps
+  the upstream feature set but adds: a Codex Desktop "organization settings"
+  gate bypass (fake app-server responses over a hooked child_process.spawn so
+  API-key auth keeps working on Desktop 26.x), a pinned Desktop auto-updater
+  disable (launcher injects CODEX_SPARKLE_ENABLED=false), a custom GitHub
+  Actions Windows release pipeline, and a fork version number that must stay
+  above the upstream tag so the built-in updater never "downgrades" users.
+  A sync must never drop the gate bypass, the updater pin, or the release
+  pipeline; everything else should track upstream releases.
+own:
+  patterns:
+    - pattern: '.github/workflows/windows-release.yml'
+      rationale: 'fork-only release pipeline; upstream has no equivalent file'
+    - pattern: 'packages/desktop-control/src/gate-bypass.ts'
+      rationale: 'fork-only module: CDP node-target spawn hook serving fake app-server JSON-RPC (org-settings gate bypass for API-key auth)'
+    - pattern: 'packages/desktop-control/src/production-controller.ts'
+      rationale: 'gate-bypass integration lives here (inspectorEndpoint option, non-blocking installGateBypass call); upstream edits to the same file must be adapted, not applied verbatim'
+    - pattern: 'packages/desktop-control/src/index.ts'
+      rationale: 'exports gate-bypass symbols; keep the export surface intact when absorbing upstream changes'
+    - pattern: 'crates/launcher/src/main.rs'
+      rationale: 'contains fork-only CODEX_SPARKLE_ENABLED=false injection in desktop_environment() and inspector plumbing; upstream launcher changes must be adapted around these blocks'
+    - pattern: 'crates/launcher/src/desktop_attachment.rs'
+      rationale: 'inspector endpoint allocation lives here; adapt upstream attachment changes around it'
+    - pattern: 'Cargo.toml'
+      rationale: 'fork version must stay above the latest upstream tag'
+    - pattern: 'package.json'
+      rationale: 'fork version must stay above the latest upstream tag'
+follow:
+  patterns:
+    - pattern: '**'
+      rationale: 'everything else tracks upstream releases'
+invariants:
+  - id: keep-gate-bypass
+    description: 'The Desktop organization-settings gate bypass (hooked spawn serving JSON-RPC responses with requirements:null) must keep working; a sync must not remove installGateBypass, its wiring in production-controller, or its exports.'
+  - id: keep-updater-pin
+    description: 'The launcher must keep injecting CODEX_SPARKLE_ENABLED=false into the Desktop environment; dropping it lets Desktop auto-update past the pinned 26.928 build and break the fork.'
+  - id: keep-windows-release
+    description: 'The fork-only .github/workflows/windows-release.yml pipeline must survive syncs unchanged.'
+  - id: version-above-upstream
+    description: 'After absorbing an upstream release, the fork version must be bumped above that upstream tag (e.g. upstream v0.14.0 -> fork v0.14.1).'
+  - id: tests-must-pass
+    description: 'Full vitest suite and launcher cargo tests must pass after the sync.'
+rationale:
+  - pattern: 'packages/desktop-control/test/production-controller.test.ts'
+    rationale: 'fork tests carry the installGateBypass dependency mock; upstream test edits in this file need adaptation, not verbatim application'
+  - pattern: 'packages/renderer-extension/test/renderer-binding-probe.test.ts'
+    rationale: 'fork carries plugin route identity assertions that upstream refactored around; adapt rather than revert'
+upstream_conflict_policy: prefer_fork

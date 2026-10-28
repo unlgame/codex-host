@@ -11,7 +11,15 @@ import {
 
 import { h } from "../dom.js";
 import { usageModelLabel } from "../usage/model-labels.js";
+import {
+  LOCAL_USAGE_HOST_ID,
+  createLatestKeyGuard,
+  usageHostOptions,
+  type RendererUsageStatisticsHost,
+  type RendererUsageStatisticsHostsProvider,
+} from "../usage/usage-hosts.js";
 import { costWithCredits } from "../usage/credits.js";
+import { summaryTiles } from "../usage/summary.js";
 import type { ConsoleMessages } from "../messages.js";
 import { createModelPricesDialog } from "../model-prices.js";
 import { createRendererSettingsIcon } from "../../settings/icons.js";
@@ -46,7 +54,7 @@ import {
   baseName,
   cacheHitRate,
   cost,
-  count,
+  count as formatCount,
   datesBetween,
   emptyTotals,
   fill,
@@ -55,14 +63,23 @@ import {
   measured,
   percent,
   projectNames,
-  tokenCount,
+  tokenCount as formatTokenCount,
   tokensWithoutCache,
   unmetered,
   type Measure,
   type Totals,
 } from "../usage/format.js";
 
-type HostRequest = (method: string, params: unknown) => Promise<unknown>;
+export type RendererUsageStatisticsRequest = (
+  method: string,
+  params: unknown,
+  hostId: string,
+) => Promise<unknown>;
+
+export type {
+  RendererUsageStatisticsHost,
+  RendererUsageStatisticsHostsProvider,
+} from "../usage/usage-hosts.js";
 type Granularity = "day" | "week" | "month";
 
 /** Console Host method that names the installed Harness plugins. */
@@ -78,6 +95,7 @@ const TABLE_LIMIT = 6;
 const SESSION_LIMIT = 10;
 
 interface View {
+  hostId: string;
   range: UsageStatisticsRange;
   measure: Measure;
   granularity: Granularity | null;
@@ -97,6 +115,7 @@ function readView(): Partial<View> {
     const range = text("range") as UsageStatisticsRange | undefined;
     const measure = text("measure") as Measure | undefined;
     const granularity = text("granularity");
+    const hostId = text("hostId");
     const harness = text("harness");
     const model = text("model");
     const project = text("project");
@@ -107,6 +126,7 @@ function readView(): Partial<View> {
       ...(granularity === "day" || granularity === "week" || granularity === "month"
         ? { granularity }
         : {}),
+      ...(hostId !== undefined && hostId.length > 0 ? { hostId } : {}),
       ...(harness !== undefined ? { harness } : {}),
       ...(model !== undefined ? { model } : {}),
       ...(project !== undefined ? { project } : {}),
@@ -159,15 +179,21 @@ function weekStart(date: string): string {
 }
 
 /**
- * Machine-wide usage of the local Host: every native session of the Harnesses that expose local
- * usage, at the public price by Model ID. The Host aggregates for the chosen range and filters;
- * the page renders the facets, lets any row, legend entry or day narrow the view, and keeps its
- * controls, focus and hover across refreshes. Tokens are shown as input
- * without cache reads and writes, with the cache on its own.
+ * Machine-wide usage of one Host: every native session of the Harnesses that expose local usage,
+ * at the public price by Model ID. The Host aggregates for the chosen range and filters; the page
+ * renders the facets, lets any row, legend entry or day narrow the view, and keeps its controls,
+ * focus and hover across refreshes. The overview includes cache in its total, with input, output
+ * and cache beneath it; the trend and rankings retain the non-cache measure.
+ *
+ * Statistics belong to the machine that produced them, so the page reads exactly one Host and
+ * offers a selector when the embedding entry can reach more than the local one. Harness, Model,
+ * project and day filters are dropped on a switch: they name values of the previous machine.
  */
 export function createUsageStatisticsPage(
   consoleMessages: ConsoleMessages,
-  request: HostRequest,
+  request: RendererUsageStatisticsRequest,
+  pageLocale?: string,
+  usageHosts?: RendererUsageStatisticsHostsProvider,
 ): RendererSettingsPageDefinition {
   const messages = consoleMessages.usageStatistics;
   return Object.freeze({
@@ -176,9 +202,14 @@ export function createUsageStatisticsPage(
     icon: "dashboard" as const,
     mount(context: RendererSettingsPageMountContext) {
       const document = context.content.ownerDocument;
-      const locale = document.documentElement.lang || "en";
+      const locale = pageLocale ?? (document.documentElement.lang || "en");
+      const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      const count = (value: number): string => formatCount(value, locale);
+      const tokenCount = (totals: Totals, value: number): string =>
+        formatTokenCount(totals, value, locale);
       const saved = readView();
       const view: View = {
+        hostId: saved.hostId ?? LOCAL_USAGE_HOST_ID,
         range: saved.range ?? "30d",
         measure: saved.measure ?? "cost",
         granularity: saved.granularity ?? null,
@@ -193,11 +224,12 @@ export function createUsageStatisticsPage(
       let error: string | null = null;
       let loadedAt = 0;
       let poll: number | undefined;
-      const tables: Record<"harness" | "model" | "project" | "sessions", TableState> = {
+      const tables: Record<"harness" | "model" | "project" | "sessions" | "recent", TableState> = {
         harness: { sort: "share", descending: true, expanded: false },
         model: { sort: "share", descending: true, expanded: false },
         project: { sort: "share", descending: true, expanded: false },
         sessions: { sort: "measure", descending: true, expanded: false },
+        recent: { sort: "last", descending: true, expanded: false },
       };
       const pointer: ChartPointer = { index: -1, x: 0 };
       const names = new Map<string, string>();
@@ -215,7 +247,7 @@ export function createUsageStatisticsPage(
       const measureLabel = (measure: Measure): string =>
         measure === "cost" ? messages.cost : messages.tokens;
       const dateFormat = (options: Intl.DateTimeFormatOptions) =>
-        new Intl.DateTimeFormat(locale, options);
+        new Intl.DateTimeFormat(locale, { ...options, timeZone });
       const shortDate = dateFormat({ month: "short", day: "numeric" });
       const longDate = dateFormat({
         year: "numeric",
@@ -232,13 +264,67 @@ export function createUsageStatisticsPage(
         minute: "2-digit",
       });
 
+      // Prices are per machine too: the dialog edits the selected Host's own price table.
       const prices = createModelPricesDialog(
         document,
         consoleMessages,
-        request,
+        (method, params) => request(method, params, view.hostId),
         context.signal,
         load,
       );
+
+      // --- Machine selector: each Host aggregates only its own machine ---------------------------
+      /** Machines offered by the embedding entry; absent when it can reach only the local Host. */
+      let offeredHosts: readonly RendererUsageStatisticsHost[] | undefined = usageHosts
+        ? []
+        : undefined;
+      const hostCombo = new ComboBox(document, {
+        label: messages.host,
+        searchLabel: messages.search,
+        emptyLabel: messages.noMatches,
+        signal: context.signal,
+        searchable: false,
+        display: (option) => `${messages.host} · ${option.label}`,
+        onChange: (key) => {
+          if (key === view.hostId) return;
+          view.hostId = key;
+          // Harness, Model, project and day name values of the machine they were read from.
+          view.harness = "";
+          view.model = "";
+          view.project = "";
+          date = null;
+          unpricedOnly = false;
+          result = null;
+          error = null;
+          loadedAt = 0;
+          // The previous machine's Harness names must not label the new machine's numbers.
+          names.clear();
+          save();
+          hostOptions();
+          render();
+          void refreshHarnessNames();
+          load();
+        },
+      });
+      const hostOptions = (): void => {
+        const options = usageHostOptions(offeredHosts, messages.localHost, view.hostId);
+        // One machine is not a choice: the console, and a Desktop without remote Hosts, stay clean.
+        hostCombo.element.hidden = options.length < 2;
+        // The empty value keeps the native button style for the local machine; a remote selection
+        // carries the accent, so another machine's numbers are never mistaken for this one's.
+        hostCombo.update(options, view.hostId === LOCAL_USAGE_HOST_ID ? "" : view.hostId);
+      };
+      const offerHosts = (): void => {
+        if (!usageHosts) return;
+        void usageHosts()
+          .then((hosts) => {
+            if (context.signal.aborted) return;
+            offeredHosts = hosts;
+            hostOptions();
+          })
+          .catch(() => undefined);
+      };
+      hostOptions();
 
       // --- Persistent header and filter bar ----------------------------------------------------
       const updated = h(document, "span", { className: "console-muted console-usage-updated" });
@@ -253,7 +339,11 @@ export function createUsageStatisticsPage(
         },
         createRendererSettingsIcon("refresh", 16),
       );
-      refresh.addEventListener("click", () => load());
+      refresh.addEventListener("click", () => {
+        // A remote Host appears when its connection does; refresh also re-offers the machines.
+        offerHosts();
+        load();
+      });
       const auto = new ComboBox(document, {
         label: messages.autoRefresh,
         searchLabel: messages.search,
@@ -299,6 +389,7 @@ export function createUsageStatisticsPage(
           document,
           "div",
           { className: "console-usage-toolbar" },
+          hostCombo.element,
           updated,
           refresh,
           auto.element,
@@ -423,7 +514,7 @@ export function createUsageStatisticsPage(
           return;
         }
         rebuildKeepingFocus(body, [
-          tiles(data),
+          summaryTiles(document, data.totals, messages, locale),
           // One day has one column: the hourly panel shows that day instead.
           data.range === "today" ? null : trendPanel(data),
           h(
@@ -435,7 +526,10 @@ export function createUsageStatisticsPage(
             projectPanel(data),
             hourlyPanel(data),
           ),
-          sessionsPanel(data),
+          data.recentSessions
+            ? sessionsPanel(messages.recentSessions, data.recentSessions, "recent")
+            : null,
+          sessionsPanel(messages.topSessions, data.sessions, "sessions"),
         ]);
       }
 
@@ -556,27 +650,6 @@ export function createUsageStatisticsPage(
         );
       }
 
-      /** Three figures, each a label and one number: cost, tokens without cache, cache hits. */
-      function tiles(data: UsageStatisticsResult): HTMLElement {
-        const totals = data.totals;
-        const tile = (key: string, label: string, value: string): HTMLElement =>
-          h(
-            document,
-            "div",
-            { className: "console-usage-tile", "data-tile": key },
-            h(document, "span", { className: "console-usage-tile__label" }, label),
-            h(document, "strong", {}, value),
-          );
-        return h(
-          document,
-          "div",
-          { className: "console-usage-tiles" },
-          tile("cost", messages.cost, cost(totals)),
-          tile("tokens", messages.tokenUsage, count(tokensWithoutCache(totals))),
-          tile("cache", messages.cacheHitRate, cacheHitRate(totals)),
-        );
-      }
-
       function trendPanel(data: UsageStatisticsResult): HTMLElement {
         const first = data.from ?? data.daily[0]?.date ?? data.to;
         const dates = datesBetween(first, data.to);
@@ -694,6 +767,7 @@ export function createUsageStatisticsPage(
           ),
           trendChart(document, {
             key: "trend",
+            locale,
             buckets: [...buckets.values()],
             series,
             measure: view.measure,
@@ -1056,7 +1130,6 @@ export function createUsageStatisticsPage(
 
       function hourlyPanel(data: UsageStatisticsResult): HTMLElement {
         const singleDay = data.filters.date !== null || data.range === "today";
-        const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
         return panel(
           singleDay ? messages.hourlyDay : messages.hourly,
           hourlyChart(document, {
@@ -1071,30 +1144,36 @@ export function createUsageStatisticsPage(
             weekStartsOnMonday: !locale.startsWith("en"),
             labels: { cost: messages.cost, tokens: messages.tokens },
           }),
-          h(document, "span", { className: "console-muted console-usage-zone" }, zone),
+          h(document, "span", { className: "console-muted console-usage-zone" }, timeZone),
         );
       }
 
-      function sessionsPanel(data: UsageStatisticsResult): HTMLElement {
+      function sessionsPanel(
+        title: string,
+        rows: UsageStatisticsSession[],
+        tableKey: "sessions" | "recent",
+      ): HTMLElement {
         const columns: Column<UsageStatisticsSession>[] = [
           {
             key: "session",
             label: messages.session,
+            sort: (row) => row.title ?? row.sessionId,
             cell: (row) => {
               const project = keyOf(row.project);
               const id = `${row.harness}:${row.sessionId}`;
+              const label = row.title || messages.untitledSession;
               const copy = focusKey(
                 h(
                   document,
                   "button",
                   {
                     type: "button",
-                    className: "console-usage-link console-usage-copy",
-                    title: `${messages.copyId}: ${row.sessionId}`,
+                    className: "console-usage-link console-usage-copy is-title",
+                    title: `${label} · ${messages.copyId}: ${row.sessionId}`,
                   },
-                  copiedSession === id ? messages.copied : row.sessionId.slice(0, 8),
+                  copiedSession === id ? messages.copied : label,
                 ),
-                `sessions:copy:${id}`,
+                `${tableKey}:copy:${id}`,
               );
               copy.addEventListener("click", () => {
                 void navigator.clipboard
@@ -1108,9 +1187,9 @@ export function createUsageStatisticsPage(
               return h(
                 document,
                 "span",
-                { className: "console-usage-name" },
-                rowFilter("project", project, projectName(project), row.project ?? undefined),
+                { className: "console-usage-session" },
                 copy,
+                rowFilter("project", project, projectName(project), row.project ?? undefined),
               );
             },
           },
@@ -1167,20 +1246,20 @@ export function createUsageStatisticsPage(
               ]),
         ];
         return panel(
-          messages.topSessions,
-          data.sessions.length === 0
+          title,
+          rows.length === 0
             ? h(document, "p", { className: "console-muted" }, messages.empty)
             : dataTable(document, {
-                key: "sessions",
+                key: tableKey,
                 columns,
-                rows: data.sessions,
-                state: tables.sessions,
+                rows,
+                state: tables[tableKey],
                 limit: SESSION_LIMIT,
                 sortLabel: (label) => fill(messages.sortBy, { name: label }),
                 moreLabel: (hidden) => fill(messages.showMore, { count: hidden }),
                 lessLabel: messages.showLess,
                 onState: (state) => {
-                  tables.sessions = state;
+                  tables[tableKey] = state;
                   render();
                 },
               }),
@@ -1237,6 +1316,7 @@ export function createUsageStatisticsPage(
         const project = filterValue(view.project);
         return {
           range: view.range,
+          timeZone,
           ...(view.harness ? { harness: view.harness } : {}),
           ...(model !== undefined ? { model } : {}),
           ...(project !== undefined ? { project } : {}),
@@ -1252,10 +1332,30 @@ export function createUsageStatisticsPage(
         else if (view.autoRefreshMs > 0) poll = window.setTimeout(load, view.autoRefreshMs);
       }
 
+      /** Harness display names come from the selected Host's own plugin directory. */
+      const harnessNamesRead = createLatestKeyGuard<string>();
+      async function refreshHarnessNames(): Promise<void> {
+        const hostId = view.hostId;
+        const isCurrent = harnessNamesRead.begin(hostId);
+        names.clear();
+        try {
+          const value = await request(HARNESS_PLUGIN_LIST_METHOD, {}, hostId);
+          // A slower response for an earlier machine must not name this one's Harnesses.
+          if (!isCurrent()) return;
+          for (const plugin of harnessPluginListResultSchema.parse(value).plugins) {
+            names.set(plugin.id, plugin.name);
+          }
+        } catch {
+          // Names fall back to Harness IDs.
+          if (!isCurrent()) return;
+        }
+        if (!context.signal.aborted) render();
+      }
+
       function load(): void {
         window.clearTimeout(poll);
         const requested = params();
-        void context.runLatest(() => request(USAGE_STATISTICS_METHOD, requested), {
+        void context.runLatest(() => request(USAGE_STATISTICS_METHOD, requested, view.hostId), {
           success(value) {
             const parsed = usageStatisticsResultSchema.safeParse(value);
             if (parsed.success) {
@@ -1283,14 +1383,8 @@ export function createUsageStatisticsPage(
 
       context.content.replaceChildren(header, prices.element, filters, notices, body);
       render();
-      void request(HARNESS_PLUGIN_LIST_METHOD, {})
-        .then((value) => {
-          for (const plugin of harnessPluginListResultSchema.parse(value).plugins) {
-            names.set(plugin.id, plugin.name);
-          }
-          if (!context.signal.aborted) render();
-        })
-        .catch(() => undefined);
+      offerHosts();
+      void refreshHarnessNames();
       load();
       return () => {
         window.clearTimeout(poll);

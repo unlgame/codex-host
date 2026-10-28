@@ -32,6 +32,7 @@ import {
 import { credentialImportChinese } from "../../src/settings/credential-import-messages.js";
 import { createHarnessAccounts } from "../../src/settings/harness-accounts.js";
 import { createHarnessVersionPanel } from "../../src/settings/harness-version-panel.js";
+import { createConnectionUpdates } from "../../src/settings/connection-updates.js";
 import { rendererSettingsMessages } from "../../src/settings/localization.js";
 import { createRendererModelClient } from "../../src/renderer-model-client.js";
 import { RendererSessionImportUnavailableError } from "../../src/renderer-session-import-client.js";
@@ -772,7 +773,7 @@ describe("Harness CLI version panel", () => {
       abort.signal,
       "pi",
       { run },
-    ) as unknown as FakeElement;
+    ).element as unknown as FakeElement;
     const button = (action: string) => {
       const element = descendants(panel).find(
         (element) => element.dataset.harnessVersionAction === action,
@@ -838,6 +839,44 @@ describe("Harness CLI version panel", () => {
     }));
     await vi.waitFor(() => expect(visibleText(panel)).toContain("original installer"));
     expect(visibleText(panel)).not.toContain("belongs to its desktop app");
+    expect(button("update").textContent).toBe("Update");
+    expect(button("update").disabled).toBe(true);
+    abort.abort();
+  });
+  it("offers a manual installer without submitting an update or claiming installation succeeded", async () => {
+    const run = vi.fn(async () => ({
+      ...state,
+      canUpdate: false,
+      manualUpdateUrl: "https://download.codebuddy.ai/WorkBuddy.dmg",
+      notice: { en: "Complete installation, then reopen Connections to verify the version." },
+    }));
+    const { panel, button, abort } = mount(run);
+    await vi.waitFor(() => expect(visibleText(panel)).toContain("Download update"));
+    const download = button("download-update");
+    expect(download.tagName).toBe("a");
+    expect(download.href).toBe("https://download.codebuddy.ai/WorkBuddy.dmg");
+    expect(download.target).toBe("_blank");
+    expect(download.rel).toBe("noopener noreferrer");
+    expect(button("update").hidden).toBe(true);
+    download.dispatch("click");
+    button("update").dispatch("click");
+    expect(run.mock.calls).toEqual([["check"]]);
+    expect(visibleText(panel)).toContain("Current version: 1.0.0");
+    expect(visibleText(panel)).not.toContain("Update verified");
+    expect(visibleText(panel)).not.toContain("an update already started continues");
+    abort.abort();
+    expect(descendants(panel).some(({ tagName }) => tagName === "a")).toBe(false);
+  });
+  it("does not offer a manual download when the checked application is current", async () => {
+    const { panel, button, abort } = mount(async () => ({
+      ...state,
+      latestVersion: "1.0.0",
+      updateAvailable: false,
+      canUpdate: false,
+      manualUpdateUrl: "https://download.codebuddy.ai/WorkBuddy.dmg",
+    }));
+    await vi.waitFor(() => expect(visibleText(panel)).toContain("original installer"));
+    expect(descendants(panel).some(({ tagName }) => tagName === "a")).toBe(false);
     expect(button("update").textContent).toBe("Update");
     expect(button("update").disabled).toBe(true);
     abort.abort();
@@ -926,6 +965,342 @@ describe("Harness installation actions", () => {
 });
 
 describe("Renderer Connections page", () => {
+  it("starts all eligible updates concurrently on the original Host and isolates failures", async () => {
+    const first = deferred<{
+      currentVersion: string;
+      latestVersion: string;
+      updateAvailable: boolean;
+      canUpdate: boolean;
+    }>();
+    const last = deferred<{
+      currentVersion: string;
+      latestVersion: string;
+      updateAvailable: boolean;
+      canUpdate: boolean;
+    }>();
+    const installation = vi.fn(async (_host: string, agent: string, action: string) => {
+      if (action === "update") {
+        if (agent === "pi") return first.promise;
+        if (agent === "claude-code") throw new Error("native-failure");
+        if (agent === "grok") return last.promise;
+      }
+      return {
+        currentVersion: "1.0.0",
+        latestVersion: "1.1.0",
+        updateAvailable: agent !== "hermes",
+        canUpdate: agent !== "kiro-cli",
+      };
+    });
+    const diagnostics: RendererConnectionDiagnostics = {
+      snapshot: () => ({
+        adapter: { state: "ready", reason: "ready", modelUpdates: 1, hook: "request-bridge" },
+        hosts: ["local", "remote-test"].map((hostId) => ({
+          hostId,
+          active: hostId === "local",
+          agents: ["pi", "claude-code", "omp", "grok", "kiro-cli", "hermes"].map((agent) => ({
+            agent,
+            availability: "ready" as const,
+            error: null,
+          })),
+        })),
+      }),
+      installation,
+      refresh: async () => undefined,
+      subscribe: () => () => undefined,
+    };
+    const content = new FakeDocument().createElement("main");
+    const scope = new RendererSettingsPageScope();
+    const page = createDefaultRendererSettingsPages(
+      rendererSettingsMessages("en"),
+      () => null,
+      () => diagnostics,
+    ).find(({ id }) => id === "connections");
+    assert(page);
+    const cleanup = page.mount({
+      content: content as unknown as HTMLElement,
+      signal: scope.signal,
+      runLatest: (op, handlers) => scope.runLatest(op, handlers),
+    });
+    const bulk = () => {
+      const button = descendants(content).find(
+        ({ dataset }) => dataset.connectionAction === "update-all",
+      );
+      assert(button);
+      return button;
+    };
+    const switchHost = (host: string) =>
+      descendants(content)
+        .find(({ dataset }) => dataset.connectionHostTab === host)
+        ?.dispatch("click");
+    const updates = () => installation.mock.calls.filter(([, , action]) => action === "update");
+    await vi.waitFor(() => expect(visibleNotesText(bulk())).toContain("Update all (4)"));
+    const button = bulk();
+    button.dispatch("click");
+    button.dispatch("click");
+    expect(updates()).toEqual(
+      ["pi", "claude-code", "omp", "grok"].map((agent) => ["local", agent, "update"]),
+    );
+    await vi.waitFor(() => expect(bulk().disabled).toBe(true));
+    switchHost("remote-test");
+    await vi.waitFor(() => expect(visibleNotesText(bulk())).toContain("Update all (4)"));
+    expect(bulk().disabled).toBe(false);
+    switchHost("local");
+    expect(visibleNotesText(bulk())).toContain("Updating 2/4");
+    last.resolve({
+      currentVersion: "1.1.0",
+      latestVersion: "1.1.0",
+      updateAvailable: false,
+      canUpdate: true,
+    });
+    await vi.waitFor(() => expect(updates()).toHaveLength(4));
+    await vi.waitFor(() => expect(visibleNotesText(bulk())).toContain("Updating 3/4"));
+    first.resolve({
+      currentVersion: "1.1.0",
+      latestVersion: "1.1.0",
+      updateAvailable: false,
+      canUpdate: true,
+    });
+    await vi.waitFor(() => expect(visibleText(content)).toContain("Updated 2; failed 2."));
+    expect(updates()).toEqual(
+      ["pi", "claude-code", "omp", "grok"].map((agent) => ["local", agent, "update"]),
+    );
+    expect(visibleText(content)).not.toContain("native-failure");
+    switchHost("remote-test");
+    expect(visibleText(content)).not.toContain("Updated 2; failed 2.");
+    if (typeof cleanup === "function") cleanup();
+    scope.dispose();
+  });
+
+  it("reuses a single update in a concurrent batch and stops notifying after the page closes", async () => {
+    const document = new FakeDocument();
+    const abort = new AbortController();
+    const pending = deferred<{
+      currentVersion: string;
+      latestVersion: string;
+      updateAvailable: boolean;
+      canUpdate: boolean;
+    }>();
+    const state = {
+      currentVersion: "1.0.0",
+      latestVersion: "1.1.0",
+      updateAvailable: true,
+      canUpdate: true,
+    };
+    const firstRun = vi.fn((action: "check" | "update") =>
+      action === "check" ? Promise.resolve(state) : pending.promise,
+    );
+    const secondPending = deferred<typeof state>();
+    const secondRun = vi.fn((action: "check" | "update") =>
+      action === "check" ? Promise.resolve(state) : secondPending.promise,
+    );
+    const panels = [firstRun, secondRun].map((run, index) =>
+      createHarnessVersionPanel(
+        document as unknown as Document,
+        rendererSettingsMessages("en"),
+        abort.signal,
+        index === 0 ? "pi" : "grok",
+        { run },
+      ),
+    );
+    await vi.waitFor(() => expect(panels.every((panel) => panel.state)).toBe(true));
+    const notify = vi.fn();
+    const updates = createConnectionUpdates(
+      document as unknown as Document,
+      rendererSettingsMessages("en"),
+      abort.signal,
+      notify,
+    );
+    const firstPanel = panels[0];
+    const secondPanel = panels[1];
+    assert(firstPanel);
+    assert(secondPanel);
+    const single = firstPanel.update();
+    const controls = updates.createControls("local", panels);
+    expect(controls.button.disabled).toBe(false);
+    (controls.button as unknown as FakeElement).dispatch("click");
+    const other = secondPanel.update();
+    expect(firstRun.mock.calls).toEqual([["check"], ["update"]]);
+    expect(secondRun.mock.calls).toEqual([["check"], ["update"]]);
+    abort.abort();
+    notify.mockClear();
+    pending.resolve({ ...state, currentVersion: "1.1.0", updateAvailable: false });
+    secondPending.resolve({ ...state, currentVersion: "1.1.0", updateAvailable: false });
+    await Promise.all([single, other]);
+    await Promise.resolve();
+    expect(notify).not.toHaveBeenCalled();
+    (controls.button as unknown as FakeElement).dispatch("click");
+    expect(firstRun).toHaveBeenCalledTimes(2);
+    expect(secondRun).toHaveBeenCalledTimes(2);
+  });
+
+  it("checks eligible rows automatically, isolates failures, and updates only on an explicit click", async () => {
+    const updated = deferred<{
+      currentVersion: string;
+      latestVersion: string;
+      updateAvailable: boolean;
+      canUpdate: boolean;
+    }>();
+    const installation = vi.fn(async (_host: string, agent: string, action: string) => {
+      if (action === "update") return updated.promise;
+      if (agent === "grok") throw { code: -32078 };
+      if (agent === "omp") throw new Error("private-native-output");
+      return {
+        currentVersion: "1.0.0",
+        latestVersion: "1.1.0",
+        updateAvailable: agent !== "claude-code",
+        canUpdate: agent !== "kiro-cli",
+      };
+    });
+    const diagnostics: RendererConnectionDiagnostics = {
+      snapshot: () => ({
+        adapter: { state: "ready", reason: "ready", modelUpdates: 1, hook: "request-bridge" },
+        hosts: [
+          {
+            hostId: "local",
+            active: true,
+            agents: [
+              ...["pi", "claude-code", "kiro-cli", "grok", "omp"].map((agent) => ({
+                agent,
+                availability: "ready" as const,
+                error: null,
+              })),
+              { agent: "deepseek-harness", availability: "notInstalled", error: null },
+              { agent: "qoder", availability: "checking", error: null },
+            ],
+          },
+        ],
+      }),
+      installation,
+      refresh: async () => undefined,
+      subscribe: () => () => undefined,
+    };
+    const page = createDefaultRendererSettingsPages(
+      rendererSettingsMessages("en"),
+      () => null,
+      () => diagnostics,
+    ).find(({ id }) => id === "connections");
+    assert(page);
+    const doc = new FakeDocument();
+    const content = doc.createElement("main");
+    const scope = new RendererSettingsPageScope();
+    const cleanup = page.mount({
+      content: content as unknown as HTMLElement,
+      signal: scope.signal,
+      runLatest: (op, handlers) => scope.runLatest(op, handlers),
+    });
+    const row = (agent: string) => {
+      const element = descendants(content).find(({ dataset }) => dataset.connectionItem === agent);
+      assert(element);
+      return element;
+    };
+    const updateButton = (agent: string) =>
+      descendants(row(agent)).find(({ dataset }) => dataset.connectionAction === "update");
+    await vi.waitFor(() => expect(updateButton("pi")).toBeDefined());
+    expect(installation.mock.calls).toEqual(
+      ["pi", "claude-code", "kiro-cli", "grok", "omp"].map((agent) => ["local", agent, "check"]),
+    );
+    for (const agent of ["pi", "kiro-cli"]) {
+      const action = descendants(row(agent)).find(
+        ({ className }) => className === "settings-connection-row__action",
+      );
+      assert(action);
+      const hint = action.children.find(
+        (child) => (child as FakeElement).className === "settings-connection-version-available",
+      ) as FakeElement | undefined;
+      expect(hint?.textContent).toBe("Update available");
+      expect(hint?.title).toBe("Current version: 1.0.0\nLatest version: 1.1.0");
+      expect(visibleText(row(agent))).not.toContain("1.1.0");
+      if (agent === "pi") {
+        expect(action.children.indexOf(updateButton(agent))).toBe(
+          action.children.indexOf(hint) + 1,
+        );
+      }
+    }
+    for (const agent of ["claude-code", "kiro-cli", "grok", "omp"]) {
+      expect(updateButton(agent)).toBeUndefined();
+    }
+    row("omp").dispatch("click", { target: null });
+    expect(visibleText(content)).toContain("Could not complete");
+    expect(visibleText(content)).not.toContain("private-native-output");
+    const update = updateButton("pi");
+    assert(update);
+    update.dispatch("click", { stopPropagation() {} });
+    update.dispatch("click", { stopPropagation() {} });
+    await vi.waitFor(() => expect(visibleText(row("pi"))).toContain("Updating"));
+    expect(installation.mock.calls.filter(([, , action]) => action === "update")).toEqual([
+      ["local", "pi", "update"],
+    ]);
+    expect(updateButton("pi")?.disabled).toBe(true);
+    updated.resolve({
+      currentVersion: "1.1.0",
+      latestVersion: "1.1.0",
+      updateAvailable: false,
+      canUpdate: true,
+    });
+    await vi.waitFor(() => expect(updateButton("pi")).toBeUndefined());
+    expect(visibleText(row("pi"))).not.toContain("Update available");
+    expect(visibleText(content)).toContain("Current version: 1.1.0");
+    if (typeof cleanup === "function") cleanup();
+    scope.dispose();
+  });
+
+  it("checks Harnesses when diagnostics finish, but ignores late results after closing", async () => {
+    let ready = false;
+    let notify = () => {};
+    const result = deferred<{
+      currentVersion: string;
+      latestVersion: string;
+      updateAvailable: boolean;
+      canUpdate: boolean;
+    }>();
+    const installation = vi.fn(() => result.promise);
+    const diagnostics: RendererConnectionDiagnostics = {
+      snapshot: () => ({
+        adapter: { state: "ready", reason: "ready", modelUpdates: 1, hook: "request-bridge" },
+        hosts: [
+          {
+            hostId: "local",
+            active: true,
+            agents: [{ agent: "pi", availability: ready ? "ready" : "checking", error: null }],
+          },
+        ],
+      }),
+      installation,
+      refresh: async () => undefined,
+      subscribe: (listener) => {
+        notify = listener;
+        return () => {};
+      },
+    };
+    const page = createDefaultRendererSettingsPages(
+      rendererSettingsMessages("en"),
+      () => null,
+      () => diagnostics,
+    ).find(({ id }) => id === "connections");
+    assert(page);
+    const content = new FakeDocument().createElement("main");
+    const scope = new RendererSettingsPageScope();
+    const cleanup = page.mount({
+      content: content as unknown as HTMLElement,
+      signal: scope.signal,
+      runLatest: (op, handlers) => scope.runLatest(op, handlers),
+    });
+    expect(installation).not.toHaveBeenCalled();
+    ready = true;
+    notify();
+    await vi.waitFor(() => expect(installation).toHaveBeenCalledOnce());
+    if (typeof cleanup === "function") cleanup();
+    scope.dispose();
+    result.resolve({
+      currentVersion: "1.0.0",
+      latestVersion: "1.1.0",
+      updateAvailable: true,
+      canUpdate: true,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(visibleText(content)).not.toContain("Update available");
+  });
+
   it("places version controls in the selected Host's inspector and preserves them across diagnostics", async () => {
     const installation = vi.fn(async () => ({
       currentVersion: "1.0.0",
@@ -964,10 +1339,12 @@ describe("Renderer Connections page", () => {
       signal: scope.signal,
       runLatest: (op, handlers) => scope.runLatest(op, handlers),
     });
+    await vi.waitFor(() => expect(installation).toHaveBeenCalledWith("local", "pi", "check"));
+    expect(installation).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(visibleText(content)).toContain("Update available"));
     const row = descendants(content).find((element) => element.dataset.connectionItem === "pi");
     if (!row) throw new Error("Expected Pi row");
     row.dispatch("click", { target: null });
-    await vi.waitFor(() => expect(installation).toHaveBeenCalledWith("local", "pi", "check"));
     const first = descendants(content).find((element) => element.dataset.harnessVersion === "pi");
     expect(first).toBeDefined();
     notify();
@@ -1551,7 +1928,7 @@ describe("Renderer Connections page", () => {
     );
     if (!dshRow) throw new Error("DeepSeek Harness row is not rendered");
     dshRow.dispatch("click", { target: null });
-    expect(visibleText(content)).toContain("0.2.0-rc.2");
+    expect(visibleText(content)).toContain("0.2.1-rc.2");
     expect(visibleText(content)).toContain(
       pluginDescriptor("deepseek-harness").notice?.["zh-CN"] ?? "missing plugin notice",
     );
@@ -2464,6 +2841,100 @@ describe("Renderer Updates page", () => {
 });
 
 describe("Renderer Session Import page", () => {
+  it("selects an explicit Host when tabs are ambiguous and invalidates disconnected Host switches", async () => {
+    const rows = [
+      {
+        nativeSessionId: "remote-session",
+        title: "Remote session",
+        cwd: "/remote",
+        updatedAt: 1,
+        running: false,
+      },
+    ];
+    const slow = deferred<{ candidates: typeof rows; total: number }>();
+    const imported = deferred<{ threadId: ReturnType<typeof hostThreadIdSchema.parse> }>();
+    const remote = {
+      hostId: "remote-1",
+      listSessionImportSources: vi.fn(async () => ({
+        harnesses: [{ harnessId: harnessIdSchema.parse("pi"), name: "Pi" }],
+      })),
+      listHarnessSessions: vi
+        .fn(async () => ({ candidates: rows, total: 1 }))
+        .mockImplementationOnce(() => slow.promise),
+      importHarnessSession: vi.fn(() => imported.promise),
+    };
+    const getClient = vi.fn((hostId?: string) => (hostId === "remote-1" ? remote : null));
+    const diagnostics = {
+      snapshot: () => ({
+        adapter: {},
+        hosts: ["local", "remote-1"].map((hostId) => ({ hostId, active: false, agents: [] })),
+      }),
+    };
+    const open = vi.fn(async () => undefined);
+    const page = createDefaultRendererSettingsPages(
+      rendererSettingsMessages("en"),
+      () => null,
+      () => diagnostics as never,
+      () => null,
+      getClient,
+      open,
+    ).find(({ id }) => id === "session-import");
+    if (!page) throw new Error("Import page missing");
+    const content = new FakeDocument().createElement("main");
+    const scope = new RendererSettingsPageScope();
+    page.mount({
+      content: content as unknown as HTMLElement,
+      signal: scope.signal,
+      runLatest: (operation, handlers) => scope.runLatest(operation, handlers),
+    });
+    const action = (name: string) => {
+      const control = descendants(content).find(
+        ({ dataset }) => dataset.sessionImportAction === name,
+      );
+      if (!control) throw new Error(`Missing ${name}`);
+      return control;
+    };
+    const visibleRows = () =>
+      descendants(content).filter(({ dataset }) => dataset.sessionImportId !== undefined);
+    const hostButton = (hostId: string) => {
+      const button = descendants(content).find(
+        ({ dataset }) => dataset.sessionImportHost === hostId,
+      );
+      if (!button) throw new Error(`Missing Host ${hostId}`);
+      return button;
+    };
+    expect(visibleText(content)).toContain("Select the Host to import sessions from");
+    expect(remote.listSessionImportSources).not.toHaveBeenCalled();
+    hostButton("remote-1").dispatch("click");
+    await vi.waitFor(() => expect(remote.listHarnessSessions).toHaveBeenCalledOnce());
+    hostButton("local").dispatch("click");
+    slow.resolve({ candidates: rows, total: 1 });
+    await vi.waitFor(() => expect(visibleText(content)).toContain("Session import is unavailable"));
+    expect(visibleRows()).toHaveLength(0);
+    expect(
+      descendants(content).filter(({ dataset }) => dataset.sessionImportHarnessOption),
+    ).toHaveLength(0);
+    hostButton("remote-1").dispatch("click");
+    await vi.waitFor(() => expect(visibleRows()).toHaveLength(1));
+    expect(hostButton("remote-1").getAttribute("aria-pressed")).toBe("true");
+    action("import").dispatch("click");
+    expect(hostButton("remote-1").disabled).toBe(true);
+    expect(hostButton("local").disabled).toBe(true);
+    getClient.mockClear();
+    hostButton("local").dispatch("click");
+    expect(getClient).not.toHaveBeenCalled();
+    imported.resolve({ threadId: hostThreadIdSchema.parse("imported-remote") });
+    await vi.waitFor(() =>
+      expect(open).toHaveBeenCalledWith("imported-remote", expect.any(AbortSignal), "remote-1"),
+    );
+    action("refresh").dispatch("click");
+    expect(getClient).toHaveBeenLastCalledWith("remote-1");
+    await vi.waitFor(() =>
+      expect(hostButton("remote-1").getAttribute("aria-pressed")).toBe("true"),
+    );
+    scope.dispose();
+  });
+
   it("configures page size, searches all metadata, rejects stale searches and locks controls during import", async () => {
     const rows = Array.from({ length: 45 }, (_, index) => ({
       nativeSessionId: `session-${index}`,
@@ -2692,74 +3163,82 @@ describe("Renderer Session Import page", () => {
     scope.dispose();
   });
 
-  it("hides Harnesses the local Host already reported as not installed, without inspecting again", async () => {
-    const client = {
-      listSessionImportSources: vi.fn(async () => ({
-        harnesses: ["pi", "kimi-code", "grok", "omp", "third-party"].map((id) => ({
-          harnessId: harnessIdSchema.parse(id),
-          name: id,
+  it.each(["local", "remote-1"])(
+    "filters installed Harnesses using only %s diagnostics",
+    async (hostId) => {
+      const client = {
+        hostId,
+        listSessionImportSources: vi.fn(async () => ({
+          harnesses: ["pi", "kimi-code", "grok", "omp", "third-party"].map((id) => ({
+            harnessId: harnessIdSchema.parse(id),
+            name: id,
+          })),
         })),
-      })),
-      listHarnessSessions: vi.fn(async () => ({ total: 0, candidates: [] })),
-      importHarnessSession: vi.fn(),
-    };
-    const agent = (name: string, availability: string) => ({
-      agent: name,
-      availability,
-      error: null,
-    });
-    const diagnostics = {
-      snapshot: vi.fn(() => ({
-        adapter: {},
-        hosts: [
-          {
-            hostId: "local",
-            active: false,
-            agents: [
-              agent("pi", "notInstalled"),
-              agent("kimi-code", "notInstalled"),
-              // Still being checked, failing or incompatible: its own error is shown on use.
-              agent("grok", "checking"),
-              agent("omp", "error"),
-            ],
-          },
-          // Import always uses the local Host; a remote workspace's status is irrelevant.
-          { hostId: "remote-1", active: true, agents: [agent("grok", "notInstalled")] },
-        ],
-      })),
-      refresh: vi.fn(),
-      subscribe: vi.fn(),
-    };
-    const page = createDefaultRendererSettingsPages(
-      rendererSettingsMessages("en"),
-      () => null,
-      () => diagnostics as never,
-      () => null,
-      () => client,
-      vi.fn(async () => undefined),
-    ).find(({ id }) => id === "session-import");
-    if (!page) throw new Error("Session import page missing");
-    const content = new FakeDocument().createElement("main");
-    const scope = new RendererSettingsPageScope();
-    page.mount({
-      content: content as unknown as HTMLElement,
-      signal: scope.signal,
-      runLatest: (operation, handlers) => scope.runLatest(operation, handlers),
-    });
-    // The first Harness that is not missing is selected, not the hidden one.
-    await vi.waitFor(() =>
-      expect(client.listHarnessSessions).toHaveBeenCalledWith(
-        expect.objectContaining({ harnessId: "grok" }),
-      ),
-    );
-    expect(
-      descendants(content)
-        .filter(({ dataset }) => dataset.sessionImportHarnessOption !== undefined)
-        .map(({ textContent }) => textContent),
-    ).toEqual(["grok", "omp", "third-party"]);
-    expect(diagnostics.refresh).not.toHaveBeenCalled();
-    scope.dispose();
-  });
+        listHarnessSessions: vi.fn(async () => ({ total: 0, candidates: [] })),
+        importHarnessSession: vi.fn(),
+      };
+      const agent = (name: string, availability: string) => ({
+        agent: name,
+        availability,
+        error: null,
+      });
+      const diagnostics = {
+        snapshot: vi.fn(() => ({
+          adapter: {},
+          hosts: [
+            {
+              hostId: "local",
+              active: false,
+              agents: [
+                agent("pi", "notInstalled"),
+                agent("kimi-code", "notInstalled"),
+                // Still being checked, failing or incompatible: its own error is shown on use.
+                agent("grok", "checking"),
+                agent("omp", "error"),
+              ],
+            },
+            // The non-selected Host must not affect this page's sources.
+            { hostId: "remote-1", active: true, agents: [agent("grok", "notInstalled")] },
+          ],
+        })),
+        refresh: vi.fn(),
+        subscribe: vi.fn(),
+      };
+      const page = createDefaultRendererSettingsPages(
+        rendererSettingsMessages("en"),
+        () => null,
+        () => diagnostics as never,
+        () => null,
+        () => client,
+        vi.fn(async () => undefined),
+      ).find(({ id }) => id === "session-import");
+      if (!page) throw new Error("Session import page missing");
+      const content = new FakeDocument().createElement("main");
+      const scope = new RendererSettingsPageScope();
+      page.mount({
+        content: content as unknown as HTMLElement,
+        signal: scope.signal,
+        runLatest: (operation, handlers) => scope.runLatest(operation, handlers),
+      });
+      // The first Harness that is not missing is selected, not the hidden one.
+      await vi.waitFor(() =>
+        expect(client.listHarnessSessions).toHaveBeenCalledWith(
+          expect.objectContaining({ harnessId: hostId === "local" ? "grok" : "pi" }),
+        ),
+      );
+      expect(
+        descendants(content)
+          .filter(({ dataset }) => dataset.sessionImportHarnessOption !== undefined)
+          .map(({ textContent }) => textContent),
+      ).toEqual(
+        hostId === "local"
+          ? ["grok", "omp", "third-party"]
+          : ["pi", "kimi-code", "omp", "third-party"],
+      );
+      expect(diagnostics.refresh).not.toHaveBeenCalled();
+      scope.dispose();
+    },
+  );
 
   it("shows a scroll hint only while the Harness options overflow and scrolls them with the wheel", async () => {
     const client = {
@@ -2953,7 +3432,7 @@ describe("Renderer Session Import page", () => {
       }),
     );
     await vi.waitFor(() =>
-      expect(open).toHaveBeenCalledWith("pi-imported", expect.any(AbortSignal)),
+      expect(open).toHaveBeenCalledWith("pi-imported", expect.any(AbortSignal), undefined),
     );
     scope.dispose();
   });
@@ -3004,15 +3483,17 @@ describe("Renderer Session Import page", () => {
     if (!refresh) throw new Error("Session Import Refresh is not rendered");
 
     expect(refresh.disabled).toBe(true);
-    expect(visibleNotesText(refresh)).toContain("Loading local sessions");
-    expect(visibleText(content)).toContain("Loading local sessions");
+    expect(visibleNotesText(refresh)).toContain("Loading sessions from the selected Host");
+    expect(visibleText(content)).toContain("Loading sessions from the selected Host");
 
     await vi.waitFor(() => expect(client.listHarnessSessions).toHaveBeenCalledOnce());
     // A synthetic second activation proves runLatest still rejects stale results even if
     // browser-level disabled handling is bypassed.
     refresh.dispatch("click");
     second.resolve({ candidates: [], total: 0 });
-    await vi.waitFor(() => expect(visibleText(content)).toContain("No local sessions"));
+    await vi.waitFor(() =>
+      expect(visibleText(content)).toContain("No sessions are available to import"),
+    );
     expect(refresh.disabled).toBe(false);
 
     first.resolve({
@@ -3021,7 +3502,7 @@ describe("Renderer Session Import page", () => {
     });
     await first.promise;
     await Promise.resolve();
-    expect(visibleText(content)).toContain("No local sessions");
+    expect(visibleText(content)).toContain("No sessions are available to import");
     expect(visibleText(content)).not.toContain("Ignored stale");
 
     refresh.dispatch("click");
@@ -3034,8 +3515,9 @@ describe("Renderer Session Import page", () => {
     scope.dispose();
   });
 
-  it("lists local DSH Modern sessions and imports only an idle row", async () => {
+  it("lists Host-scoped sessions and opens the imported Thread on the same Host", async () => {
     const client = {
+      hostId: "remote-1",
       listSessionImportSources: vi.fn(async () => ({
         harnesses: [
           { harnessId: harnessIdSchema.parse("deepseek-harness"), name: "DeepSeek Harness" },
@@ -3064,13 +3546,15 @@ describe("Renderer Session Import page", () => {
         threadId: hostThreadIdSchema.parse("imported-thread"),
       })),
     };
+    const otherClient = { ...client, hostId: "remote-2", importHarnessSession: vi.fn() };
+    let selectedClient = client;
     const openImportedThread = vi.fn(async () => undefined);
     const page = createDefaultRendererSettingsPages(
       rendererSettingsMessages("zh-CN"),
       () => null,
       () => null,
       () => null,
-      () => client,
+      () => selectedClient,
       openImportedThread,
     ).find(({ id }) => id === "session-import");
     if (!page) throw new Error("Session Import page is not registered");
@@ -3104,7 +3588,7 @@ describe("Renderer Session Import page", () => {
       "会话导入",
     );
     expect(visibleText(content)).toContain(
-      "可选 Harness 来自本地 Host。运行状态未知时，请先在原生客户端关闭该会话再导入，避免同时写入。",
+      "可选 Harness 来自当前 Host。运行状态未知时，请先在原生客户端关闭该会话再导入，避免同时写入。",
     );
     const harnessSelector = descendants(content).find(
       ({ dataset }) => dataset.sessionImportHarness === "selector",
@@ -3146,6 +3630,7 @@ describe("Renderer Session Import page", () => {
     expect(actions[1]?.disabled).toBe(true);
     actions[1]?.dispatch("click");
     expect(client.importHarnessSession).not.toHaveBeenCalled();
+    selectedClient = otherClient;
     actions[0]?.dispatch("click");
     expect(descendants(content)).toContain(actions[0]);
     expect(actions[0]?.getAttribute("aria-disabled")).toBe("true");
@@ -3156,8 +3641,13 @@ describe("Renderer Session Import page", () => {
       harnessId: "deepseek-harness",
       nativeSessionId: "idle-session-identifier-that-is-long",
     });
+    expect(otherClient.importHarnessSession).not.toHaveBeenCalled();
     await vi.waitFor(() =>
-      expect(openImportedThread).toHaveBeenCalledWith("imported-thread", expect.any(AbortSignal)),
+      expect(openImportedThread).toHaveBeenCalledWith(
+        "imported-thread",
+        expect.any(AbortSignal),
+        "remote-1",
+      ),
     );
     scope.dispose();
   });
@@ -3342,8 +3832,9 @@ describe("Renderer Session Import page", () => {
     }
   });
 
-  it("keeps project recovery actions after committed import navigation fails", async () => {
+  it("keeps project recovery and the original Host after committed import navigation fails", async () => {
     const client = {
+      hostId: "remote-original",
       listSessionImportSources: vi.fn(async () => ({
         harnesses: [
           { harnessId: harnessIdSchema.parse("deepseek-harness"), name: "DeepSeek Harness" },
@@ -3365,6 +3856,7 @@ describe("Renderer Session Import page", () => {
         threadId: hostThreadIdSchema.parse("imported-thread"),
       })),
     };
+    let selectedClient = client;
     const openImportedThread = vi
       .fn()
       .mockRejectedValueOnce(new Error("private navigation detail"))
@@ -3374,7 +3866,7 @@ describe("Renderer Session Import page", () => {
       () => null,
       () => null,
       () => null,
-      () => client,
+      () => selectedClient,
       openImportedThread,
     ).find(({ id }) => id === "session-import");
     if (!page) throw new Error("Session Import page is not registered");
@@ -3411,6 +3903,7 @@ describe("Renderer Session Import page", () => {
       ({ dataset }) => dataset.sessionImportAction === "retry-open",
     );
     if (!retry) throw new Error("Retry open action is not rendered");
+    selectedClient = { ...client, hostId: "remote-other" };
     retry.dispatch("click");
     expect(retry.disabled).toBe(true);
     expect(retry.getAttribute("aria-busy")).toBe("true");
@@ -3419,6 +3912,11 @@ describe("Renderer Session Import page", () => {
         ?.disabled,
     ).toBe(true);
     await vi.waitFor(() => expect(openImportedThread).toHaveBeenCalledTimes(2));
+    expect(openImportedThread).toHaveBeenLastCalledWith(
+      "imported-thread",
+      expect.any(AbortSignal),
+      "remote-original",
+    );
     expect(client.importHarnessSession).toHaveBeenCalledOnce();
     scope.dispose();
   });
@@ -3437,7 +3935,7 @@ describe("Renderer Session Import page", () => {
       runLatest: (operation, handlers) => scope.runLatest(operation, handlers),
     });
 
-    expect(visibleText(content)).toContain("Session import is unavailable for this local Harness");
+    expect(visibleText(content)).toContain("Session import is unavailable for this Harness");
     expect(
       descendants(content).filter(({ dataset }) => dataset.sessionImportAction === "import"),
     ).toHaveLength(0);

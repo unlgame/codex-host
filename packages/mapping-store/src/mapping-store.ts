@@ -246,15 +246,27 @@ function processIdentity(pid: number): ProcessIdentity | null {
       const startedAt = Date.parse(result);
       return { executablePath: null, startedAt: Number.isFinite(startedAt) ? startedAt : null };
     }
+    // CIM can expose CreationDate for a reused system PID even when Get-Process cannot
+    // read its Path/StartTime. Serialize UTC explicitly: Windows PowerShell's default
+    // DateTime JSON representation is not an ISO timestamp that Date.parse can read.
     const query = [
       "$ErrorActionPreference = 'Stop'",
-      `$process = Get-Process -Id ${pid}`,
-      "$process | Select-Object Path, StartTime | ConvertTo-Json -Compress",
+      `$process = Get-CimInstance -ClassName Win32_Process -Filter 'ProcessId = ${pid}'`,
+      "if ($null -ne $process) { [pscustomobject]@{ " +
+        "Path = $process.ExecutablePath; " +
+        "StartTime = $(if ($null -ne $process.CreationDate) { " +
+        "$process.CreationDate.ToUniversalTime().ToString('o', [Globalization.CultureInfo]::InvariantCulture) " +
+        "} else { $null }) } | ConvertTo-Json -Compress }",
     ].join("; ");
     const result = execFileSync(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", query],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+        timeout: 5_000,
+      },
     ).trim();
     if (!result) return { executablePath: null, startedAt: null };
     const parsed = JSON.parse(result) as { Path?: unknown; StartTime?: unknown };
@@ -1114,7 +1126,7 @@ export class MappingStore {
     }
   }
 
-  /** Atomically writes, or with null removes, a Thread's Desktop metadata file. */
+  /** Atomically patches owned metadata fields, retaining unknown fields on disk. */
   async #writeMetadataFile(
     hostThreadId: HostThreadId,
     metadata: StoredThreadMetadataV1 | null,
@@ -1123,12 +1135,18 @@ export class MappingStore {
     const temp = `${target}.tmp-${randomUUID()}`;
     let handle: FileHandle | null = null;
     try {
-      if (!metadata) {
+      const retained = Object.fromEntries(
+        Object.entries((await this.#readMetadata(hostThreadId)) ?? {}).filter(
+          ([name]) => !["formatVersion", "hostThreadId", ...THREAD_METADATA_FIELDS].includes(name),
+        ),
+      );
+      if (!metadata && Object.keys(retained).length === 0) {
         await rm(target, { force: true });
         return;
       }
+      const next = { ...retained, formatVersion: 1, hostThreadId, ...metadata };
       handle = await open(temp, "wx", constants.S_IRUSR | constants.S_IWUSR);
-      await handle.writeFile(`${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+      await handle.writeFile(`${JSON.stringify(next, null, 2)}\n`, "utf8");
       await handle.sync();
       await handle.close();
       handle = null;

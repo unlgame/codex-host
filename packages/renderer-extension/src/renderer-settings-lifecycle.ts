@@ -1,3 +1,5 @@
+import type { RendererUsageStatisticsRequest } from "./console/pages/usage-statistics.js";
+import type { RendererUsageStatisticsHostsProvider } from "./console/usage/usage-hosts.js";
 import type { RemoteConnectionsControl } from "./remote-connections-control.js";
 import type { LoadedSessionsClient } from "./settings/loaded-sessions-table.js";
 import { readCodexLocaleSettings, type CodexLocaleSettings } from "./codex-locale-adapter.js";
@@ -29,9 +31,12 @@ export interface RendererSettingsLifecycleOptions {
   getUpdateClient?(): RendererUpdateClient | null;
   getConnectionDiagnostics?(): RendererConnectionDiagnostics | null;
   getAccountClient?(): RendererCodexAccountClient | null;
-  getSessionImportClient?(): RendererSessionImportClient | null;
+  getSessionImportClient?(hostId?: string): RendererSessionImportClient | null;
   getLoadedSessionsClient?(): LoadedSessionsClient | null;
   getRemoteConnections?(): RemoteConnectionsControl | null;
+  requestUsageStatistics?: RendererUsageStatisticsRequest;
+  /** Machines the usage statistics page may read besides the local Host. */
+  usageStatisticsHosts?: RendererUsageStatisticsHostsProvider;
   openImportedThread?: RendererImportedThreadOpener;
   onLocaleChange?(locale: RendererSettingsLocale): void;
 }
@@ -71,15 +76,17 @@ export function installRendererSettingsLifecycle(
       options.getConnectionDiagnostics ?? (() => null),
       options.getAccountClient ?? (() => null),
       options.getSessionImportClient ?? (() => null),
-      async (threadId, signal) => {
+      async (threadId, signal, hostId) => {
         if (!options.openImportedThread) {
           throw new Error("Imported Thread navigation is unavailable");
         }
-        await options.openImportedThread(threadId, signal);
+        await options.openImportedThread(threadId, signal, hostId);
         if (!disposed && !signal.aborted) shell?.close();
       },
       options.getLoadedSessionsClient ?? (() => null),
       options.getRemoteConnections ?? (() => null),
+      options.requestUsageStatistics,
+      options.usageStatisticsHosts,
     );
     const nextShell = installRendererSettingsShell(definitions, messages, ownerWindow.document, {
       onOpenChange(open) {

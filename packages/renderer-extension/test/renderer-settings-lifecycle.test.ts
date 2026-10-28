@@ -181,6 +181,25 @@ describe("Renderer Settings lifecycle", () => {
     lifecycle.dispose();
   });
 
+  it("passes the local statistics transport to settings pages", () => {
+    const requestUsageStatistics = vi.fn(async () => ({}));
+    const usageStatisticsHosts = vi.fn(async () => []);
+    const ownerWindow = {
+      navigator: { languages: ["en"] },
+      document: {},
+      setTimeout,
+      clearTimeout,
+    } as unknown as Window;
+    const lifecycle = installRendererSettingsLifecycle(ownerWindow, {
+      requestUsageStatistics,
+      usageStatisticsHosts,
+    });
+    const call = vi.mocked(createDefaultRendererSettingsPages).mock.calls.at(-1);
+    expect(call?.[8]).toBe(requestUsageStatistics);
+    expect(call?.[9]).toBe(usageStatisticsHosts);
+    lifecycle.dispose();
+  });
+
   it("binds Session import to its narrow client and closes only after navigation", async () => {
     const events: string[] = [];
     const client = {
@@ -212,9 +231,17 @@ describe("Renderer Settings lifecycle", () => {
     if (!getClient || !open) throw new Error("Session Import settings seams were not installed");
 
     expect(getClient()).toBe(client);
-    await open(hostThreadIdSchema.parse("imported-thread"), new AbortController().signal);
+    await open(
+      hostThreadIdSchema.parse("imported-thread"),
+      new AbortController().signal,
+      "remote-1",
+    );
 
-    expect(openImportedThread).toHaveBeenCalledWith("imported-thread", expect.any(AbortSignal));
+    expect(openImportedThread).toHaveBeenCalledWith(
+      "imported-thread",
+      expect.any(AbortSignal),
+      "remote-1",
+    );
     expect(events).toEqual(["opened", "closed"]);
     lifecycle.dispose();
   });

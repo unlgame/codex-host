@@ -17,8 +17,25 @@ export interface HarnessUsageStatisticsCapability {
   readModelLabels?(signal: AbortSignal): Promise<Readonly<Record<string, string>>>;
   /** Every unit of native storage that may hold usage, with a fingerprint read without content. */
   listSources(signal: AbortSignal): Promise<readonly HarnessUsageSource[]>;
-  /** The usage entries in one unit. A copied history (a fork) may repeat entry IDs. */
+  /** The usage entries in one unit. A copied history (a fork) may repeat entry IDs.
+   * Throw HarnessUsageSourceChangedError if the listed fingerprint no longer describes the read.
+   */
   readSource(id: string, signal: AbortSignal): Promise<readonly HarnessUsageEntry[]>;
+}
+
+/** A read whose source changed; callers must list sources again before retrying it. */
+export class HarnessUsageSourceChangedError extends Error {
+  readonly code = "HARNESS_USAGE_SOURCE_CHANGED";
+
+  /** Plugins may bundle their own copy of this contract, so instanceof is insufficient. */
+  static is(error: unknown): error is HarnessUsageSourceChangedError {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "HARNESS_USAGE_SOURCE_CHANGED"
+    );
+  }
 }
 
 export interface HarnessUsageSource {
@@ -47,6 +64,8 @@ export interface HarnessUsageEntry {
   reasoningOutputTokens?: number;
   /** Native session (thread) the request belongs to, when the storage names it. */
   sessionId?: string;
+  /** Display name of that session, when the storage names it. */
+  sessionTitle?: string;
   /** Absolute working directory of that session, when the storage names it. */
   cwd?: string;
   /**
@@ -69,10 +88,28 @@ export interface HarnessUsageEntry {
 export interface HarnessUsageSession {
   sessionId?: string | null | undefined;
   cwd?: string | null | undefined;
+  /** Native display name: user-given, agent-generated, or first typed prompt. */
+  title?: string | null | undefined;
 }
 
 const MAX_SESSION_ID_LENGTH = 512;
 const MAX_CWD_LENGTH = 4096;
+/** Match the statistics schema's UTF-16 limit without splitting a code point. */
+const MAX_SESSION_TITLE_LENGTH = 200;
+
+/** Single-line session name, or undefined when the storage has none the Host can show. */
+export function usageSessionTitle(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replaceAll("\0", "").replaceAll(/\s+/gu, " ").trim();
+  if (!normalized) return undefined;
+  if (normalized.length <= MAX_SESSION_TITLE_LENGTH) return normalized;
+  let title = "";
+  for (const character of normalized) {
+    if (title.length + character.length >= MAX_SESSION_TITLE_LENGTH) break;
+    title += character;
+  }
+  return `${title.trimEnd()}…`;
+}
 
 function sessionIdOk(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= MAX_SESSION_ID_LENGTH;
@@ -98,11 +135,13 @@ export function withUsageSession(
 ): HarnessUsageEntry {
   const sessionId = sessionIdOk(session.sessionId) ? session.sessionId : undefined;
   const cwd = cwdOk(session.cwd) ? session.cwd : undefined;
+  const sessionTitle = sessionId !== undefined ? usageSessionTitle(session.title) : undefined;
   if (sessionId === undefined && cwd === undefined) return entry;
   return {
     ...entry,
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
+    ...(sessionTitle !== undefined ? { sessionTitle } : {}),
   };
 }
 
@@ -162,6 +201,11 @@ export function parseHarnessUsageEntry(value: unknown): HarnessUsageEntry | null
   if (((entry.reasoningOutputTokens as number | undefined) ?? 0) > entry.outputTokens) return null;
   if (entry.sessionId !== undefined && !sessionIdOk(entry.sessionId)) return null;
   if (entry.cwd !== undefined && !cwdOk(entry.cwd)) return null;
+  if (entry.sessionTitle !== undefined) {
+    const sessionTitle = usageSessionTitle(entry.sessionTitle);
+    if (sessionTitle === undefined) return null;
+    entry.sessionTitle = sessionTitle;
+  }
   if (entry.tokensUnknown !== undefined && entry.tokensUnknown !== true) return null;
   if (
     entry.costUsd !== undefined &&

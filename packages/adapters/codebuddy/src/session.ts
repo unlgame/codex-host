@@ -24,7 +24,10 @@ import type {
   TurnOutcome,
   TurnStartAccepted,
   TurnStartCommand,
+  TurnSteerAccepted,
+  TurnSteerCommand,
 } from "@codexhost/harness-adapter";
+import { unsupportedSteer } from "@codexhost/harness-adapter";
 import { HarnessOutputChannel } from "@codexhost/harness-adapter";
 import {
   nativeSessionRefSchema,
@@ -39,6 +42,7 @@ import {
   CodeBuddyError,
   failure,
   nativeError,
+  nativeTurnError,
   record,
   text,
   type CodeBuddyRuntimeProfile,
@@ -428,6 +432,7 @@ export class CodeBuddySession implements HarnessSession {
   }
 
   execute(command: TurnStartCommand): Promise<HarnessResult<TurnStartAccepted>>;
+  execute(command: TurnSteerCommand): Promise<HarnessResult<TurnSteerAccepted>>;
   execute(command: TurnCancelCommand): Promise<HarnessResult<TurnCancelAccepted>>;
   execute(command: InteractionRespondCommand): Promise<HarnessResult<InteractionRespondAccepted>>;
   execute(command: ModelSelectCommand): Promise<HarnessResult<ModelSelectCompleted>>;
@@ -439,7 +444,11 @@ export class CodeBuddySession implements HarnessSession {
     command: HostCommand,
   ): Promise<
     HarnessResult<
-      TurnStartAccepted | TurnCancelAccepted | InteractionRespondAccepted | ModelSelectCompleted
+      | TurnStartAccepted
+      | TurnSteerAccepted
+      | TurnCancelAccepted
+      | InteractionRespondAccepted
+      | ModelSelectCompleted
     >
   > {
     const invocation =
@@ -464,11 +473,16 @@ export class CodeBuddySession implements HarnessSession {
     nativeCommand = false,
   ): Promise<
     HarnessResult<
-      TurnStartAccepted | TurnCancelAccepted | InteractionRespondAccepted | ModelSelectCompleted
+      | TurnStartAccepted
+      | TurnSteerAccepted
+      | TurnCancelAccepted
+      | InteractionRespondAccepted
+      | ModelSelectCompleted
     >
   > {
     if (this.#closed || this.#fault)
       return failure("invalidState", "Session is closed or faulted", this.profile);
+    if (command.type === "turn.steer") return unsupportedSteer(this.profile.displayName);
     if (command.type === "interaction.respond") return this.#interactions.respond(command);
     if (command.type === "turn.cancel") {
       const active = this.#active;
@@ -578,13 +592,7 @@ export class CodeBuddySession implements HarnessSession {
             ? { status: "succeeded" }
             : {
                 status: "failed",
-                error: nativeError(
-                  new CodeBuddyError(
-                    "nativeFailure",
-                    `Native Turn stopped: ${text(stop) || "unknown"} (${text(meta["codebuddy.ai/outcome"]) || "no native outcome"})`,
-                  ),
-                  this.profile,
-                ),
+                error: nativeTurnError(stop, meta, this.profile),
               };
       const snapshot = await this.#snapshot();
       const added = snapshot.turns.filter(

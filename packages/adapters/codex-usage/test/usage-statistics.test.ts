@@ -1,11 +1,15 @@
+import { randomBytes } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { appendFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { setImmediate as setImmediatePromise } from "node:timers/promises";
 import { zstdCompressSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { HarnessUsageSourceChangedError } from "@codexhost/harness-adapter/usage-statistics";
 import { createCodexUsageStatistics, readCodexRollouts } from "../src/usage-statistics.js";
 import { createUsageStatisticsAdapter } from "../src/plugin.js";
-import { copyRelation } from "../src/rollout-io.js";
+import { copyRelation, rolloutBytes, rolloutLines } from "../src/rollout-io.js";
 
 const THREAD = "00000000-0000-4000-8000-000000000001";
 const CHILD = "00000000-0000-4000-8000-000000000002";
@@ -81,6 +85,81 @@ describe("Codex native counters", () => {
     expect(entries.reduce((sum, e) => sum + e.inputTokens, 0)).toBe(input);
     expect(entries.reduce((sum, e) => sum + e.outputTokens, 0)).toBe(output);
     expect(entries.reduce((sum, e) => sum + (e.cachedInputTokens ?? 0), 0)).toBe(cached);
+  });
+
+  it("reads session metadata written with sorted keys and nested types first", async () => {
+    // Current Codex writes session_meta as ordinal, payload, timestamp, type; the payload
+    // carries base_instructions.provenance.type and enough text to push `type` past 1 KiB.
+    const sorted = {
+      ordinal: 0,
+      payload: {
+        base_instructions: {
+          provenance: { model: "priced-model", type: "model" },
+          text: "x".repeat(4096),
+        },
+        cwd: "/work",
+        id: THREAD,
+        session_id: THREAD,
+      },
+      timestamp: new Date(BASE).toISOString(),
+      type: "session_meta",
+    };
+    const entries = await read([sorted, context(), count(tokens(100, 10), tokens(100, 10))]);
+    expect(entries.map((e) => [e.inputTokens, e.outputTokens, e.cwd])).toEqual([
+      [100, 10, "/work"],
+    ]);
+  });
+
+  it("reads a token count whose payload type sits past the first kibibyte", async () => {
+    const entries = await read([
+      meta(),
+      context(),
+      {
+        timestamp: new Date(BASE + 1000).toISOString(),
+        type: "event_msg",
+        payload: {
+          info: { total_token_usage: tokens(100, 10), last_token_usage: tokens(100, 10) },
+          note: "n".repeat(2048),
+          type: "token_count",
+        },
+      },
+    ]);
+    expect(entries.map((e) => [e.inputTokens, e.outputTokens])).toEqual([[100, 10]]);
+  });
+
+  it("reads a user message title when the role sits past the first kibibyte", async () => {
+    const entries = await read([
+      meta(),
+      context(),
+      count(tokens(100, 10), tokens(100, 10)),
+      {
+        timestamp: new Date(BASE + 2000).toISOString(),
+        type: "response_item",
+        payload: {
+          type: "message",
+          content: [{ type: "input_text", text: "ship the usage fix" }],
+          padding: "p".repeat(2048),
+          role: "user",
+        },
+      },
+    ]);
+    expect(entries[0]).toMatchObject({ sessionTitle: "ship the usage fix" });
+  });
+
+  it("does not split a pending pair when nested content only quotes a user role", async () => {
+    const amount = tokens(100, 10);
+    const entries = await read([
+      meta(),
+      context(),
+      record("response", amount, tokens(1100, 110)),
+      row("response_item", {
+        type: "function_call_output",
+        output: `${"x".repeat(1100)}\n"role": "user"\n`,
+      }),
+      count(tokens(900, 90), amount),
+    ]);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ id: `${THREAD}:response`, inputTokens: 100 });
   });
 
   it("uses cumulative deltas, ignores repeated checkpoints, and counts runtime resets", async () => {
@@ -201,6 +280,30 @@ describe("Codex native counters", () => {
     expect(bare[0]).not.toHaveProperty("cwd");
   });
 
+  it("names a session from the first typed user prompt, skipping AGENTS.md dumps", async () => {
+    const entries = await read([
+      meta(THREAD, { cwd: "/work/codex" }),
+      row("response_item", {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "<recommended_plugins> unused plugins" }],
+      }),
+      row("response_item", {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "# AGENTS.md instructions for /work\n\nDo not." }],
+      }),
+      row("response_item", {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Fix the login page\n\nKeep tests green." }],
+      }),
+      context(),
+      record("r1", tokens(100, 10, 50), tokens(100, 10, 50)),
+    ]);
+    expect(entries[0]).toMatchObject({ sessionTitle: "Fix the login page Keep tests green." });
+  });
+
   it("leaves out parent history a spawned subagent replays before its first turn", async () => {
     const entries = await read([
       meta(THREAD, { forked_from_id: "parent", timestamp: new Date(BASE).toISOString() }),
@@ -256,6 +359,35 @@ describe("Codex native counters", () => {
 });
 
 describe("Codex read-only storage", () => {
+  it("rejects an append during parsing and accepts it only after relisting", async () => {
+    const target = await file(`sessions/${filename()}`, [
+      meta(),
+      context(),
+      count(tokens(100, 10), tokens(100, 10)),
+    ]);
+    let appended = false;
+    const reader = createCodexUsageStatistics(
+      { CODEX_HOME: root },
+      {
+        onTokenCount: () => {
+          if (appended) return;
+          appended = true;
+          appendFileSync(target, `${JSON.stringify(count(tokens(250, 30), tokens(150, 20), 2))}\n`);
+        },
+      },
+    );
+    const source = (await reader.listSources(signal))[0];
+    if (!source) throw new Error("missing fixture source");
+    await expect(reader.readSource(source.id, signal)).rejects.toSatisfy(
+      HarnessUsageSourceChangedError.is,
+    );
+    const fresh = (await reader.listSources(signal))[0];
+    expect(fresh?.fingerprint).not.toBe(source.fingerprint);
+    expect((await reader.readSource(source.id, signal)).map((e) => e.inputTokens)).toEqual([
+      100, 150,
+    ]);
+  });
+
   it("discovers configured home, combines resumed files, proves archive prefixes, and detects changes", async () => {
     const initial = [meta(), context(), count(tokens(100, 10), tokens(100, 10))];
     const a = await file(`sessions/2026/01/01/${filename()}`, initial);
@@ -284,6 +416,29 @@ describe("Codex read-only storage", () => {
     ]);
     await expect(reader.readSource(source.id, signal)).rejects.toThrow("changed while reading");
     expect((await reader.listSources(signal))[0]?.fingerprint).not.toBe(source.fingerprint);
+  });
+
+  it("prefers the session index name over the first typed prompt", async () => {
+    await file(`sessions/${filename()}`, [
+      meta(),
+      row("response_item", {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Typed prompt" }],
+      }),
+      context(),
+      record("r1", tokens(100, 10), tokens(100, 10)),
+    ]);
+    await writeFile(
+      path.join(root, "session_index.jsonl"),
+      `${JSON.stringify({ id: THREAD, thread_name: "Index title" })}\n`,
+    );
+    const reader = createCodexUsageStatistics({ CODEX_HOME: root });
+    const source = (await reader.listSources(signal))[0];
+    if (!source) throw new Error("missing fixture source");
+    expect((await reader.readSource(source.id, signal))[0]).toMatchObject({
+      sessionTitle: "Index title",
+    });
   });
 
   it("does not discard divergent archive files merely because their names match", async () => {
@@ -317,6 +472,84 @@ describe("Codex read-only storage", () => {
     await writeFile(compressed, (await readFile(compressed)).subarray(0, -1));
     await expect(readCodexRollouts([compressed], THREAD, signal)).rejects.toThrow();
     await expect(copyRelation(original, compressed, signal)).rejects.toThrow();
+  });
+
+  it(
+    "decodes a frame larger than the former compressed-frame limit",
+    { timeout: 120_000 },
+    async () => {
+      // Incompressible bytes: the frame itself is larger than the old 64 MiB cap.
+      const original = randomBytes(66 * 1024 * 1024);
+      const compressed = path.join(root, `${filename()}.zst`);
+      await writeFile(compressed, zstdCompressSync(original));
+      expect((await stat(compressed)).size).toBeGreaterThan(64 * 1024 * 1024);
+      let decoded = 0;
+      for await (const chunk of rolloutBytes(compressed, signal)) decoded += chunk.length;
+      expect(decoded).toBe(original.length);
+    },
+  );
+
+  it(
+    "decodes a frame larger than the former single-shot output limit",
+    { timeout: 120_000 },
+    async () => {
+      // Repetitive text keeps the file small while the decoded frame exceeds the old 128 MiB cap.
+      const line = Buffer.from(`${"x".repeat(1023)}\n`);
+      const original = Buffer.concat(Array.from({ length: 130 * 1024 }, () => line));
+      const compressed = path.join(root, `${filename()}.zst`);
+      await writeFile(compressed, zstdCompressSync(original));
+      let lines = 0;
+      for await (const decoded of rolloutLines(compressed, signal)) {
+        if (decoded.length !== 1023) throw new Error("unexpected decoded line");
+        lines += 1;
+      }
+      expect(lines).toBe(130 * 1024);
+    },
+  );
+
+  it("drops skippable frames between decoded frames", async () => {
+    const first = Buffer.from('{"a":1}\n'),
+      second = Buffer.from('{"b":2}\n'),
+      payload = Buffer.from("ignored");
+    const skippable = Buffer.alloc(8 + payload.length);
+    skippable.writeUInt32LE(0x184d2a50, 0);
+    skippable.writeUInt32LE(payload.length, 4);
+    payload.copy(skippable, 8);
+    const compressed = path.join(root, `${filename()}.zst`);
+    await writeFile(
+      compressed,
+      Buffer.concat([zstdCompressSync(first), skippable, zstdCompressSync(second)]),
+    );
+    const lines: string[] = [];
+    for await (const line of rolloutLines(compressed, signal)) lines.push(line);
+    expect(lines).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  it("stops a decoded stream without an unhandled pipeline rejection", async () => {
+    const compressed = path.join(root, `${filename()}.zst`);
+    // A frame large enough that the consumer stops while it is still being decoded.
+    const payload = Buffer.alloc(4 * 1024 * 1024, "x");
+    await writeFile(
+      compressed,
+      Buffer.concat([zstdCompressSync(payload), zstdCompressSync(Buffer.from("tail\n"))]),
+    );
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const reader = rolloutBytes(compressed, signal);
+      expect(await reader.next()).toMatchObject({ done: false });
+      // A consumer may stop mid-frame: `copyRelation` does on the first differing byte.
+      await reader.return(undefined);
+      // Unhandled rejections are reported once the microtask queue drains, so one event-loop turn
+      // is enough; no guessed duration is involved.
+      await setImmediatePromise();
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   it("rejects corrupt compressed input and cancels reads", async () => {

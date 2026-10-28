@@ -3,34 +3,45 @@ import type * as FsPromises from "node:fs/promises";
 import { mkdir, mkdtemp, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Query, SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import {
   harnessPermissionModeIdSchema,
   harnessThinkingOptionIdSchema,
   hostTurnIdSchema,
   nativeCheckpointRefSchema,
   nativeSessionRefSchema,
+  type HostInteractionId,
 } from "@codexhost/shared-contracts";
 
 import type { HarnessOutput, HarnessSession } from "@codexhost/harness-adapter";
 import { ClaudeCodeAdapter, type ClaudeCodeAdapterOptions } from "../src/index.js";
 import { projectClaudePlanLimitToCredits } from "../src/claude-code-adapter.js";
 import { ClaudeCodeExecutableError } from "../src/command.js";
+import { ClaudeUltracodeUnavailableError } from "../src/ultracode.js";
 import { CLAUDE_DEFAULT_MODEL_REF, encodeClaudeModelRef } from "../src/model-catalog.js";
-import type { ClaudePermissionMode } from "../src/permission-modes.js";
-import type {
-  ClaudeAdapterDependencies,
-  ClaudeApprovalRequest,
-  ClaudeAutonomousTurnHandler,
-  ClaudeIdleTurnHandler,
-  ClaudeInteractionResponse,
-  ClaudePlanLimitEvent,
-  ClaudeQuestionRequest,
-  ClaudeTransportContextUsage,
-  ClaudeTransportTurnResult,
-  ClaudeTurnEvent,
-  ClaudeTurnTransport,
+import {
+  claudeBypassPermissionsAvailable,
+  type ClaudePermissionMode,
+} from "../src/permission-modes.js";
+import { ClaudeSdkTransport } from "../src/sdk-transport.js";
+import {
+  ClaudeSteerMissedTurnError,
+  type ClaudeAdapterDependencies,
+  type ClaudeApprovalRequest,
+  type ClaudeAutonomousTurnHandler,
+  type ClaudeIdleTurnHandler,
+  type ClaudeInteractionResponse,
+  type ClaudePlanLimitEvent,
+  type ClaudeQuestionRequest,
+  type ClaudeTransportContextUsage,
+  type ClaudeTransportTurnResult,
+  type ClaudeTurnEvent,
+  type ClaudeTurnTransport,
 } from "../src/transport.js";
+import { FakeQuery } from "./fake-sdk-query.js";
+
+afterEach(() => vi.useRealTimers());
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof FsPromises>();
@@ -54,7 +65,7 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
   }): void {
     const handler = this.autonomousTurnHandler;
     if (!handler) throw new Error("No fake Claude autonomous Turn handler");
-    handler.start(turn.nativeTurnKey);
+    handler.start(turn.nativeTurnKey, turn.nativeTurnKey);
     for (const event of turn.events) handler.onEvent(event);
     handler.onTerminal(turn.result);
   }
@@ -76,7 +87,11 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
     this.stopBackgroundTaskCalls.push(taskId);
     this.backgroundTaskIds.delete(taskId);
   }
+  readonly stopTasks = vi.fn(async (taskIds: readonly string[]): Promise<void> => {
+    for (const taskId of taskIds) this.backgroundTaskIds.delete(taskId);
+  });
   readonly abort = vi.fn(async () => undefined);
+  readonly abortContinuation = vi.fn(async () => undefined);
   readonly close = vi.fn(async () => undefined);
   contextUsage: ClaudeTransportContextUsage | null = null;
   permissionMode: ClaudePermissionMode;
@@ -103,6 +118,16 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
   readonly initCalls: string[] = [];
   readonly recapCalls: string[] = [];
   readonly turns: Array<{ text: string; userMessageId: string }> = [];
+  readonly steers: Array<{ text: string; messageId: string; priority: "next" }> = [];
+  /** Whether the fake CLI reported `msg_lifecycle_v1` in its init capabilities. */
+  nativeSteer = true;
+  /** Whether the fake requested Turn currently runs a root tool call. */
+  rootToolRunning = true;
+  readonly #pendingSteers = new Map<
+    string,
+    { resolve(): void; reject(error: ClaudeSteerMissedTurnError): void }
+  >();
+  readonly #steerTakeovers = new Map<string, (started: boolean) => void>();
   #assistantMessageId: string | null = null;
   #active:
     | {
@@ -179,6 +204,55 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
     });
   }
 
+  supportsNativeSteer(): boolean {
+    return this.nativeSteer;
+  }
+
+  canSteerActiveTurn(): boolean {
+    if (!this.nativeSteer) return false;
+    if (this.#active !== undefined) return this.rootToolRunning;
+    return this.idleLive && this.idleHandler !== null;
+  }
+
+  steer(text: string, messageId: string, onTakeover?: (started: boolean) => void): Promise<void> {
+    if (!this.canSteerActiveTurn()) return Promise.reject(new ClaudeSteerMissedTurnError());
+    this.steers.push({ text, messageId, priority: "next" });
+    if (onTakeover) this.#steerTakeovers.set(messageId, onTakeover);
+    return new Promise((resolve, reject) => {
+      this.#pendingSteers.set(messageId, { resolve, reject });
+    });
+  }
+
+  /** Claude drains the written steer into a native turn (`command_lifecycle` `started`). */
+  startSteer(messageId: string): void {
+    this.#takeOverSteer(messageId, true);
+  }
+
+  /** Claude ends the written steer without a native turn, or the transport stops awaiting it. */
+  releaseSteer(messageId: string): void {
+    this.#takeOverSteer(messageId, false);
+  }
+
+  #takeOverSteer(messageId: string, started: boolean): void {
+    const onTakeover = this.#steerTakeovers.get(messageId);
+    this.#steerTakeovers.delete(messageId);
+    onTakeover?.(started);
+  }
+
+  recordSteer(messageId: string): void {
+    const pending = this.#pendingSteers.get(messageId);
+    if (!pending) throw new Error(`No pending Claude steer ${messageId}`);
+    this.#pendingSteers.delete(messageId);
+    pending.resolve();
+  }
+
+  #rejectPendingSteers(): void {
+    const error = new ClaudeSteerMissedTurnError();
+    for (const pending of this.#pendingSteers.values()) pending.reject(error);
+    this.#pendingSteers.clear();
+    for (const messageId of [...this.#steerTakeovers.keys()]) this.releaseSteer(messageId);
+  }
+
   event(event: ClaudeTurnEvent): void {
     if (this.#active) {
       this.#active.onEvent(event);
@@ -219,6 +293,7 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
 
   finish(result: ClaudeTransportTurnResult): void {
     if (this.#active) {
+      // A written steer stays Claude's to deliver after the Turn ends, like the SDK transport.
       this.#active.resolve(result);
       this.#active = undefined;
       this.#assistantMessageId = null;
@@ -233,6 +308,7 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
   }
 
   fault(error: unknown): void {
+    this.#rejectPendingSteers();
     this.#active?.reject(error);
     this.#active = undefined;
     this.#assistantMessageId = null;
@@ -241,7 +317,10 @@ class FakeClaudeTransport implements ClaudeTurnTransport {
 
 function fixture(
   options: ClaudeCodeAdapterOptions = {},
-  { bypassPermissionsAvailable = true }: { bypassPermissionsAvailable?: boolean } = {},
+  {
+    bypassPermissionsAvailable = true,
+    accountCreditsSupported = false,
+  }: { bypassPermissionsAvailable?: boolean; accountCreditsSupported?: boolean } = {},
 ) {
   const history: unknown[] = [];
   const transports: FakeClaudeTransport[] = [];
@@ -257,6 +336,11 @@ function fixture(
     inspectInstallation,
     createInspector: vi.fn(() => {
       const inspector = {
+        inspectAccount: vi.fn(async () =>
+          accountCreditsSupported
+            ? { credits: { usedPercent: 10, periodType: "five_hour" as const } }
+            : null,
+        ),
         close: vi.fn(async () => undefined),
         inspect: vi.fn(async () => ({
           models: [
@@ -348,6 +432,14 @@ async function nextOutput(iterator: AsyncIterator<HarnessOutput>) {
   }
 }
 
+function hasUserMessageItem(output: HarnessOutput): boolean {
+  if (output.kind !== "event") return false;
+  if (output.event.type === "item.started") return output.event.item.type === "userMessage";
+  if (output.event.type === "item.completed")
+    return output.event.snapshot.item.type === "userMessage";
+  return false;
+}
+
 async function nextEvent(iterator: AsyncIterator<HarnessOutput>) {
   const output = await nextOutput(iterator);
   if (output.done) throw new Error("Harness output ended unexpectedly");
@@ -361,6 +453,199 @@ async function nextInteraction(iterator: AsyncIterator<HarnessOutput>) {
   if (output.value.kind !== "interaction") throw new Error("Expected a Harness Interaction");
   return output.value.interaction;
 }
+
+describe("Claude Code Composer cache countdown", () => {
+  it.each([true, false])(
+    "publishes only for native subscription quota (supported: %s)",
+    async (accountCreditsSupported) => {
+      const { adapter, transports } = fixture({}, { accountCreditsSupported });
+      await adapter.inspectAccount();
+      const session = await openSession(adapter);
+      const outputs: HarnessOutput[] = [];
+      const collecting = (async () => {
+        for await (const output of session.outputs) outputs.push(output);
+      })();
+      try {
+        await session.execute(textTurn("cache-countdown"));
+        const transport = transports[0];
+        if (!transport) throw new Error("Expected a Claude transport");
+        const before = Math.floor(Date.now() / 1000);
+        transport.event({ type: "message.completed", messageId: "reply" });
+        transport.finish({ status: "succeeded" });
+        await vi.waitFor(() =>
+          expect(
+            outputs.some(
+              (output) => output.kind === "event" && output.event.type === "turn.completed",
+            ),
+          ).toBe(true),
+        );
+        const usages = outputs.flatMap((output) =>
+          output.kind === "event" && output.event.type === "session.usage.changed"
+            ? [output.event.usage]
+            : [],
+        );
+        if (accountCreditsSupported) {
+          expect(usages).toContainEqual(
+            expect.objectContaining({
+              composerIndicators: [
+                {
+                  kind: "countdown",
+                  id: "prompt-cache",
+                  expiresAtUnix: expect.any(Number),
+                  label: { en: "Prompt cache", "zh-CN": "提示词缓存" },
+                },
+              ],
+            }),
+          );
+          const expiry = usages.find((usage) => usage?.composerIndicators?.length)
+            ?.composerIndicators?.[0]?.expiresAtUnix;
+          expect(expiry).toBeGreaterThanOrEqual(before + 3600);
+          expect(expiry).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 3600);
+        } else {
+          expect(usages.every((usage) => !usage?.composerIndicators?.length)).toBe(true);
+        }
+      } finally {
+        await adapter.close();
+        await collecting;
+      }
+    },
+  );
+
+  it("uses the recorded response time when subscription quota arrives later, excluding local output", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const outputs: HarnessOutput[] = [];
+    const collecting = (async () => {
+      for await (const output of session.outputs) outputs.push(output);
+    })();
+    try {
+      await session.execute(textTurn("cache-late-quota"));
+      const transport = transports[0];
+      if (!transport) throw new Error("Expected a Claude transport");
+      transport.event({ type: "message.completed", messageId: "local", localCommand: true });
+      transport.planLimit({ fiveHour: { utilizationPercent: 10 } });
+      await vi.waitFor(() =>
+        expect(
+          outputs.some(
+            (output) => output.kind === "event" && output.event.type === "session.usage.changed",
+          ),
+        ).toBe(true),
+      );
+      expect(
+        outputs.some(
+          (output) =>
+            output.kind === "event" &&
+            output.event.type === "session.usage.changed" &&
+            output.event.usage?.composerIndicators?.length,
+        ),
+      ).toBe(false);
+      // Account inspection can establish that the current authentication has no quota.
+      await adapter.inspectAccount();
+      const clock = vi.spyOn(Date, "now").mockReturnValueOnce(1_800_000_000_000);
+      try {
+        transport.event({ type: "message.completed", messageId: "reply" });
+      } finally {
+        clock.mockRestore();
+      }
+      transport.planLimit({ fiveHour: { utilizationPercent: 11 } });
+      await vi.waitFor(() =>
+        expect(outputs).toContainEqual({
+          kind: "event",
+          event: expect.objectContaining({
+            type: "session.usage.changed",
+            usage: expect.objectContaining({
+              composerIndicators: [expect.objectContaining({ expiresAtUnix: 1_800_003_600 })],
+            }),
+          }),
+        }),
+      );
+      transport.finish({ status: "succeeded" });
+    } finally {
+      await adapter.close();
+      await collecting;
+    }
+  });
+
+  it.each([true, false])(
+    "uses the latest quota evidence when account inspection completes (native push during inspection: %s)",
+    async (pushDuringInspection) => {
+      const { adapter, dependencies, transports } = fixture();
+      const accountResult = deferred<null>();
+      const createInspector = dependencies.createInspector;
+      dependencies.createInspector = (input) => ({
+        ...createInspector(input),
+        inspectAccount: () => accountResult.promise,
+      });
+      const session = await openSession(adapter);
+      const outputs: HarnessOutput[] = [];
+      const collecting = (async () => {
+        for await (const output of session.outputs) outputs.push(output);
+      })();
+      try {
+        await session.execute(textTurn("cache-account-race"));
+        const transport = transports[0];
+        if (!transport) throw new Error("Expected a Claude transport");
+        transport.event({ type: "message.completed", messageId: "reply" });
+        const planLimit = { fiveHour: { utilizationPercent: 10 } };
+        if (!pushDuringInspection) transport.planLimit(planLimit);
+        const inspection = adapter.inspectAccount();
+        if (pushDuringInspection) transport.planLimit(planLimit);
+        accountResult.resolve(null);
+        await expect(inspection).resolves.toBeNull();
+        transport.finish({ status: "succeeded" });
+        await vi.waitFor(() =>
+          expect(
+            outputs.some(
+              (output) => output.kind === "event" && output.event.type === "turn.completed",
+            ),
+          ).toBe(true),
+        );
+        const usages = outputs.flatMap((output) =>
+          output.kind === "event" && output.event.type === "session.usage.changed"
+            ? [output.event.usage]
+            : [],
+        );
+        expect(usages.at(-1)?.composerIndicators).toHaveLength(pushDuringInspection ? 1 : 0);
+        if (pushDuringInspection) {
+          expect(adapter.credits()).toEqual({ usedPercent: 10, periodType: "five_hour" });
+        }
+      } finally {
+        accountResult.resolve(null);
+        await adapter.close();
+        await collecting;
+      }
+    },
+  );
+
+  it("restores the last main assistant response from native history without restarting the clock", async () => {
+    const { adapter, history } = fixture({}, { accountCreditsSupported: true });
+    await adapter.inspectAccount();
+    history.push(
+      { type: "assistant", timestamp: "2026-08-01T10:00:00Z" },
+      { type: "user", timestamp: "2026-08-01T10:10:00Z" },
+      { type: "assistant", isSidechain: true, timestamp: "2026-08-01T10:20:00Z" },
+      { type: "assistant", parent_tool_use_id: "tool", timestamp: "2026-08-01T10:30:00Z" },
+      { type: "assistant", timestamp: "invalid" },
+    );
+    try {
+      const opened = await adapter.open({
+        kind: "resume",
+        cwd: "/synthetic",
+        nativeRef: nativeSessionRefSchema.parse({
+          harnessId: "claude-code",
+          nativeSessionId: "cache-history",
+          formatVersion: 1,
+        }),
+      });
+      if (!opened.ok) throw new Error(opened.error.message);
+      expect(opened.value.initialUsage?.composerIndicators?.[0]?.expiresAtUnix).toBe(
+        Date.parse("2026-08-01T11:00:00Z") / 1000,
+      );
+    } finally {
+      await adapter.close();
+    }
+  });
+});
 
 describe("Claude Code usage metering", () => {
   const usage = {
@@ -521,6 +806,7 @@ describe("projectClaudePlanLimitToCredits", () => {
       productUsage: [
         {
           product: "7-day window",
+          periodType: "seven_day",
           usagePercent: 18,
           resetsAt: new Date(1_756_648_800 * 1000).toISOString(),
         },
@@ -586,6 +872,123 @@ describe("Claude Code HarnessAdapter", () => {
     );
     await adapter.close();
   });
+  it.each(["create", "resume"] as const)(
+    "preserves native environment with scoped delegation on %s",
+    async (kind) => {
+      const nativeEnvironment = {
+        HOME: "/native-user",
+        PATH: "/usr/bin:/bin:/native-tools",
+        HTTPS_PROXY: "http://127.0.0.1:2080",
+        CLAUDE_CONFIG_DIR: "/native-user/claude-config",
+      };
+      const { adapter, dependencies } = fixture({ environment: nativeEnvironment });
+      try {
+        for (const threadId of ["first-thread", "second-thread"]) {
+          const environment = {
+            CODEXHOST_RUNTIME_ENDPOINT: "http://127.0.0.1:43123",
+            CODEXHOST_RUNTIME_TOKEN: `synthetic-${threadId}`,
+            CODEXHOST_THREAD_ID: threadId,
+          };
+          const opened = await adapter.open({
+            cwd: "/synthetic",
+            environment,
+            ...(kind === "resume"
+              ? {
+                  kind,
+                  nativeRef: nativeSessionRefSchema.parse({
+                    harnessId: "claude-code",
+                    nativeSessionId: `native-${threadId}`,
+                    formatVersion: 1,
+                  }),
+                }
+              : { kind }),
+          });
+          if (!opened.ok) throw new Error(opened.error.message);
+          await opened.value.execute(textTurn(`environment-${threadId}`));
+          expect(dependencies.createTransport).toHaveBeenLastCalledWith(
+            expect.objectContaining({ environment: { ...nativeEnvironment, ...environment } }),
+          );
+          expect(environment).not.toHaveProperty("HOME");
+          await opened.value.close();
+        }
+        expect(nativeEnvironment).not.toHaveProperty("CODEXHOST_THREAD_ID");
+      } finally {
+        await adapter.close();
+      }
+    },
+  );
+
+  it.each(["create", "resume"] as const)(
+    "uses the native sandbox declaration for scoped %s permission checks and transport",
+    async (kind) => {
+      const nativeEnvironment = { HOME: "/native-user", IS_SANDBOX: "1" };
+      const scoped = { CODEXHOST_THREAD_ID: "root-caller" };
+      const expected = { ...nativeEnvironment, ...scoped };
+      const { adapter, dependencies } = fixture({ environment: nativeEnvironment });
+      vi.spyOn(dependencies, "bypassPermissionsAvailable").mockImplementation((environment) =>
+        claudeBypassPermissionsAvailable(environment ?? nativeEnvironment, { getuid: () => 0 }),
+      );
+      try {
+        const opened = await adapter.open({
+          cwd: "/synthetic",
+          environment: scoped,
+          permissionModeId: harnessPermissionModeIdSchema.parse("bypassPermissions"),
+          ...(kind === "resume"
+            ? {
+                kind,
+                nativeRef: nativeSessionRefSchema.parse({
+                  harnessId: "claude-code",
+                  nativeSessionId: "native-root",
+                  formatVersion: 1,
+                }),
+              }
+            : { kind }),
+        });
+        expect(opened.ok).toBe(true);
+        if (!opened.ok) throw new Error(opened.error.message);
+        await opened.value.execute(textTurn(`sandbox-${kind}`));
+        expect(dependencies.bypassPermissionsAvailable).toHaveBeenLastCalledWith(expected);
+        expect(dependencies.createTransport).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            environment: expected,
+            permissionMode: "bypassPermissions",
+          }),
+        );
+        await opened.value.close();
+      } finally {
+        await adapter.close();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "still rejects root without an effective sandbox (explicit override=%s)",
+    async (override) => {
+      const nativeEnvironment = { HOME: "/native-user", ...(override ? { IS_SANDBOX: "1" } : {}) };
+      const scoped = {
+        CODEXHOST_THREAD_ID: "root-caller",
+        ...(override ? { IS_SANDBOX: "0" } : {}),
+      };
+      const { adapter, dependencies } = fixture({ environment: nativeEnvironment });
+      vi.spyOn(dependencies, "bypassPermissionsAvailable").mockImplementation((environment) =>
+        claudeBypassPermissionsAvailable(environment ?? nativeEnvironment, { getuid: () => 0 }),
+      );
+      try {
+        expect(
+          await adapter.open({
+            kind: "create",
+            cwd: "/synthetic",
+            environment: scoped,
+            permissionModeId: harnessPermissionModeIdSchema.parse("bypassPermissions"),
+          }),
+        ).toMatchObject({ ok: false, error: { code: "unsupported" } });
+        expect(dependencies.createTransport).not.toHaveBeenCalled();
+      } finally {
+        await adapter.close();
+      }
+    },
+  );
+
   it("opens and closes unused Sessions without creating a Transport", async () => {
     const { adapter, dependencies } = fixture();
     const session = await openSession(adapter);
@@ -713,6 +1116,7 @@ describe("Claude Code HarnessAdapter", () => {
           { id: "high", label: "High" },
           { id: "xhigh", label: "Extra High" },
           { id: "max", label: "Max" },
+          { id: "ultracode", label: "Ultracode" },
         ],
         defaultThinkingOptionId: "auto",
       },
@@ -755,6 +1159,8 @@ describe("Claude Code HarnessAdapter", () => {
       },
       history: { fork: true, forkAcrossCwd: false, rollbackLastTurn: true },
       subagents: { observe: true, readTranscript: true },
+      // No CLI has reported its init capabilities yet.
+      steer: false,
     });
     const iterator = session.outputs[Symbol.asyncIterator]();
     await expect(
@@ -775,6 +1181,7 @@ describe("Claude Code HarnessAdapter", () => {
           { id: "high" },
           { id: "xhigh" },
           { id: "max" },
+          { id: "ultracode" },
         ],
       },
     });
@@ -788,6 +1195,161 @@ describe("Claude Code HarnessAdapter", () => {
     if (configured.ok) await configured.value.close();
     expect(dependencies.createTransport).not.toHaveBeenCalled();
     await session.close();
+  });
+
+  it("declares and accepts native steering only when the CLI confirms steers", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const outputs: HarnessOutput[] = [];
+    const consuming = (async () => {
+      for await (const output of session.outputs) outputs.push(output);
+    })();
+    await session.execute(textTurn("turn-1"));
+    await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+    expect(session.capabilities.steer).toBe(true);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake transport was not created");
+    // Without a running root tool call the steer could run as the next Turn instead.
+    transport.rootToolRunning = false;
+    expect(session.capabilities.steer).toBe(false);
+    transport.rootToolRunning = true;
+    transport.nativeSteer = false;
+    expect(session.capabilities.steer).toBe(false);
+    await expect(
+      session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("turn-1"),
+        input: [{ type: "text", text: "not confirmed" }],
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "unsupported" } });
+    expect(transport.steers).toHaveLength(0);
+    transport.finish({ status: "succeeded" });
+    await session.close();
+    await consuming;
+    await adapter.close();
+  });
+
+  it("completes a root tool window Turn at its result once the steer folded in", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("turn-1"));
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    const steered = session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("turn-1"),
+      input: [{ type: "text", text: "fold this in" }],
+    });
+    await vi.waitFor(() => expect(transport.steers).toHaveLength(1));
+    const messageId = transport.steers[0]?.messageId ?? "";
+    transport.recordSteer(messageId);
+    await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+    // Claude drains it after the tool call, before the Root result.
+    transport.startSteer(messageId);
+    transport.delta("Folded answer.", "folded-answer");
+    transport.finish({ status: "succeeded" });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      turnId: "turn-1",
+      outcome: { status: "succeeded" },
+    });
+    expect(transport.idleLive).toBe(false);
+    await session.close();
+  });
+
+  it("inserts a steer into the active Turn and does not emit a userMessage item", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const outputs: HarnessOutput[] = [];
+    const consuming = (async () => {
+      for await (const output of session.outputs) outputs.push(output);
+    })();
+    const started = session.execute(textTurn("turn-1"));
+    await vi.waitFor(() => expect(transports[0]?.turns).toHaveLength(1));
+    await started;
+    const steer = session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("turn-1"),
+      input: [{ type: "text", text: "steer this" }],
+    });
+    await vi.waitFor(() => expect(transports[0]?.steers).toHaveLength(1));
+    expect(transports[0]?.steers).toEqual([
+      { text: "steer this", messageId: "claude-id-3", priority: "next" },
+    ]);
+    transports[0]?.recordSteer("claude-id-3");
+    await expect(steer).resolves.toEqual({ ok: true, value: { accepted: true } });
+    expect(outputs.some(hasUserMessageItem)).toBe(false);
+    await expect(session.execute(textTurn("turn-2"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "sessionBusy" },
+    });
+    expect(transports[0]?.turns).toHaveLength(1);
+    await expect(
+      session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("turn-2"),
+        input: [{ type: "text", text: "other" }],
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalidState" } });
+    await expect(
+      session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("turn-1"),
+        input: [{ type: "text", text: "" }],
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalidRequest" } });
+    expect(transports[0]?.steers).toHaveLength(1);
+    const late = session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("turn-1"),
+      input: [{ type: "text", text: "late" }],
+    });
+    await vi.waitFor(() => expect(transports[0]?.steers).toHaveLength(2));
+    // The first steer folds in after the tool call, before the Root result.
+    transports[0]?.startSteer("claude-id-3");
+    transports[0]?.finish({ status: "succeeded" });
+    // Claude already holds the written input and runs it next, so it is still accepted.
+    transports[0]?.recordSteer("claude-id-4");
+    await expect(late).resolves.toEqual({ ok: true, value: { accepted: true } });
+    // The late steer is not drained yet: the Turn stays held and runs it as its next Segment.
+    expect(
+      outputs.some((output) => output.kind === "event" && output.event.type === "turn.completed"),
+    ).toBe(false);
+    expect(transports[0]?.idleLive).toBe(true);
+    transports[0]?.startSteer("claude-id-4");
+    transports[0]?.event({ type: "segment.started" });
+    transports[0]?.delta("Late answer.", "late-answer");
+    transports[0]?.finish({ status: "succeeded" });
+    await vi.waitFor(() =>
+      expect(
+        outputs.some((output) => output.kind === "event" && output.event.type === "turn.completed"),
+      ).toBe(true),
+    );
+    await expect(
+      session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("turn-1"),
+        input: [{ type: "text", text: "idle" }],
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalidState" } });
+    await session.close();
+    await expect(
+      session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("turn-1"),
+        input: [{ type: "text", text: "closed" }],
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalidState" } });
+    expect(outputs.some(hasUserMessageItem)).toBe(false);
+    await consuming;
+    await adapter.close();
   });
 
   it("omits Auto when no runtime Model explicitly supports it", async () => {
@@ -1081,8 +1643,11 @@ describe("Claude Code HarnessAdapter", () => {
     await session.close();
   });
 
-  it("forks an exact Native prefix while later source history continues", async () => {
+  it("forks an exact Native prefix from a worktree while later source history continues", async () => {
     const { adapter, dependencies } = fixture();
+    vi.mocked(dependencies.getSessionInfo).mockResolvedValueOnce({
+      cwd: "/synthetic/.claude/worktrees/topic",
+    });
     const sourceRef = nativeSessionRefSchema.parse({
       harnessId: "claude-code",
       nativeSessionId: "source-session",
@@ -1221,10 +1786,6 @@ describe("Claude Code HarnessAdapter", () => {
         checkpoint: foreignCheckpoint,
       }),
     ).resolves.toMatchObject({ ok: false, error: { code: "invalidRequest" } });
-    vi.mocked(dependencies.getSessionInfo).mockResolvedValueOnce({ cwd: "/other-workspace" });
-    await expect(
-      adapter.open({ kind: "fork", cwd: "/synthetic", sourceRef, checkpoint }),
-    ).resolves.toMatchObject({ ok: false, error: { code: "unsupported" } });
     history.push(
       {
         type: "user",
@@ -2538,8 +3099,8 @@ describe("Claude Code HarnessAdapter", () => {
     await session.close();
   });
 
-  it("cancels a held Root Turn without waiting for background Subagents", async () => {
-    const { adapter, transports } = fixture();
+  it("stops background Subagents natively before cancelling a held Root Turn", async () => {
+    const { adapter, transports } = fixture({ continuationQuiescenceMs: 10 });
     const session = await openSession(adapter);
     const iterator = session.outputs[Symbol.asyncIterator]();
 
@@ -2576,6 +3137,7 @@ describe("Claude Code HarnessAdapter", () => {
         turnId: hostTurnIdSchema.parse("delegate in background"),
       }),
     ).resolves.toEqual({ ok: true, value: { cancellationRequested: true } });
+    expect(transport.stopTasks).toHaveBeenCalledWith(["native-agent-1"]);
     expect(await nextEvent(iterator)).toMatchObject({
       type: "subagent.state.changed",
       nativeSubagentId: "native-agent-1",
@@ -2586,6 +3148,996 @@ describe("Claude Code HarnessAdapter", () => {
       outcome: { status: "cancelled" },
     });
     expect(transport.abort).not.toHaveBeenCalled();
+    expect(transport.abortContinuation).not.toHaveBeenCalled();
+    await session.close();
+  });
+
+  async function holdForBackgroundAgent(options: ClaudeCodeAdapterOptions = {}) {
+    const { adapter, transports } = fixture(options);
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("delegate in background"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.event({
+      type: "subagent.started",
+      operation: "spawn",
+      callId: "agent-1",
+      description: "Inspect implementation",
+      background: true,
+    });
+    await nextEvent(iterator);
+    transport.event({
+      type: "subagent.completed",
+      callId: "agent-1",
+      isError: false,
+      continuesInBackground: true,
+      nativeSubagentId: "native-agent-1",
+      resultSummary: "Async agent launched successfully",
+    });
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    return { adapter, iterator, session, transport, transports };
+  }
+
+  async function holdForUndrainedSteer(options: ClaudeCodeAdapterOptions = {}) {
+    const { adapter, transports } = fixture(options);
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("pending-steer"));
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    const steered = session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("pending-steer"),
+      input: [{ type: "text", text: "then cancel" }],
+    });
+    await vi.waitFor(() => expect(transport.steers).toHaveLength(1));
+    const messageId = transport.steers[0]?.messageId ?? "";
+    transport.recordSteer(messageId);
+    await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+    transport.finish({ status: "succeeded" });
+    await vi.waitFor(() => expect(transport.idleLive).toBe(true));
+    return { adapter, iterator, messageId, session, transport };
+  }
+
+  const cancelDelegation = {
+    type: "turn.cancel",
+    turnId: hostTurnIdSchema.parse("delegate in background"),
+  } as const;
+
+  it("closes Claude Code when it does not confirm a background stop", async () => {
+    const { iterator, session, transport, transports } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 10,
+    });
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    transport.stopTasks.mockRejectedValueOnce(
+      new Error("Claude background task stop was not confirmed"),
+    );
+
+    await expect(session.execute(cancelDelegation)).resolves.toEqual({
+      ok: true,
+      value: { cancellationRequested: true },
+    });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(transport.close).toHaveBeenCalled();
+    expect(outputs).toContainEqual(
+      expect.objectContaining({ type: "subagent.state.changed", status: "interrupted" }),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+
+    // The next Turn resumes the native Session on a new process.
+    await session.execute(textTurn("next"));
+    expect(transports).toHaveLength(2);
+    await session.close();
+  });
+
+  it("interrupts the answer Claude starts on its own after a background stop", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 200,
+    });
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+
+    await session.execute(cancelDelegation);
+    // Claude Code answers the stopped Subagent's notification in a new Root Segment.
+    transport.event({ type: "segment.started" });
+    await vi.waitFor(() => expect(transport.abortContinuation).toHaveBeenCalledOnce());
+    transport.delta("The agent was stopped.", "continuation");
+    transport.finish({ status: "cancelled", reason: "aborted_streaming" });
+
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+    expect(outputs).toContainEqual(
+      expect.objectContaining({
+        type: "item.completed",
+        snapshot: expect.objectContaining({
+          item: expect.objectContaining({ type: "agentMessage", text: "The agent was stopped." }),
+          outcome: expect.objectContaining({ status: "cancelled" }),
+        }),
+      }),
+    );
+    expect(transport.autonomousTurnHandler).not.toBeNull();
+    expect(transport.idleLive).toBe(false);
+    await session.close();
+  });
+
+  it("steers a held Turn's continuation without stopping its background Subagent", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent();
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    // The Turn is held on the background Subagent; its continuation is idle-live.
+    expect(transport.idleLive).toBe(true);
+    expect(session.capabilities.steer).toBe(true);
+
+    const steered = session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("delegate in background"),
+      input: [{ type: "text", text: "status update please" }],
+    });
+    await vi.waitFor(() => expect(transport.steers).toHaveLength(1));
+    expect(transport.steers).toEqual([
+      {
+        text: "status update please",
+        messageId: expect.any(String),
+        priority: "next",
+      },
+    ]);
+    transport.recordSteer(transport.steers[0]?.messageId ?? "");
+    await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+    // Message delivery must not take the cancellation path that stops background work.
+    expect(transport.stopTasks).not.toHaveBeenCalled();
+    expect(transport.abort).not.toHaveBeenCalled();
+    expect(transport.abortContinuation).not.toHaveBeenCalled();
+
+    // The answer arrives as the held Turn's next Segment; the Turn keeps waiting.
+    transport.startSteer(transport.steers[0]?.messageId ?? "");
+    transport.event({ type: "segment.started" });
+    transport.delta("The background Agent is still running.", "steer-answer");
+    transport.finish({ status: "succeeded" });
+    await nextOutputMatching(
+      iterator,
+      (output) =>
+        output.kind === "event" &&
+        output.event.type === "item.completed" &&
+        output.event.snapshot.item.type === "agentMessage" &&
+        output.event.snapshot.item.text.includes("still running"),
+    );
+    expect(transport.idleLive).toBe(true);
+    expect(transport.stopTasks).not.toHaveBeenCalled();
+
+    // Once the background Subagent settles, the steered Turn completes successfully.
+    transport.threadEvent({
+      type: "subagent.settled",
+      nativeSubagentId: "native-agent-1",
+      status: "completed",
+      resultSummary: "Agent finished",
+    });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
+    await session.close();
+  });
+
+  it("runs a steer written during a held Turn's final continuation as that Turn's next Segment", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 200,
+    });
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    vi.useFakeTimers();
+    try {
+      // Every background Subagent settles and Claude streams its final continuation text.
+      transport.threadEvent({
+        type: "subagent.settled",
+        nativeSubagentId: "native-agent-1",
+        status: "completed",
+        resultSummary: "Agent finished",
+      });
+      transport.event({ type: "segment.started" });
+      transport.delta("All background work is done.", "final-summary");
+      expect(session.capabilities.steer).toBe(true);
+
+      const steered = session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("delegate in background"),
+        input: [{ type: "text", text: "one more thing" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const messageId = transport.steers[0]?.messageId ?? "";
+      transport.recordSteer(messageId);
+      await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+
+      // The continuation keeps streaming, and no tool call lets the steer fold in: it ends first,
+      // and Claude starts the steer as its next native turn after quiescence would have elapsed.
+      transport.delta(" Wrapping up.", "final-summary");
+      transport.finish({ status: "succeeded" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(transport.idleLive).toBe(true);
+
+      transport.startSteer(messageId);
+      transport.event({ type: "segment.started" });
+      transport.delta("Here is the one more thing.", "steer-answer");
+      transport.finish({ status: "succeeded" });
+      await vi.advanceTimersByTimeAsync(1_000);
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(outputs.filter((event) => event.type === "turn.started")).toEqual([]);
+      expect(
+        outputs.some(
+          (event) =>
+            event.type === "item.completed" &&
+            event.snapshot.item.type === "agentMessage" &&
+            event.snapshot.item.text.includes("one more thing"),
+        ),
+      ).toBe(true);
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: "delegate in background",
+        outcome: { status: "succeeded" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+    await session.close();
+  });
+
+  it("refuses to steer a held Turn whose cancellation is in flight", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent();
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    expect(session.capabilities.steer).toBe(true);
+
+    await expect(
+      session.execute({
+        type: "turn.cancel",
+        turnId: hostTurnIdSchema.parse("delegate in background"),
+      }),
+    ).resolves.toEqual({ ok: true, value: { cancellationRequested: true } });
+
+    // The Turn is being cancelled and owes no further input.
+    expect(session.capabilities.steer).toBe(false);
+    await expect(
+      session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("delegate in background"),
+        input: [{ type: "text", text: "too late" }],
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "invalidState" } });
+    expect(transport.steers).toHaveLength(0);
+    await session.close();
+  });
+
+  it("keeps a held Turn open while a written steer awaits its native Segment", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 200,
+    });
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    vi.useFakeTimers();
+    try {
+      // The background Subagent settles and continuation quiescence starts counting down.
+      transport.threadEvent({
+        type: "subagent.settled",
+        nativeSubagentId: "native-agent-1",
+        status: "completed",
+        resultSummary: "Agent finished",
+      });
+
+      const steered = session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("delegate in background"),
+        input: [{ type: "text", text: "hold the Turn open" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(transport.steers).toHaveLength(1);
+
+      // Quiescence passes without the written steer being taken over; the Turn must stay open.
+      await vi.advanceTimersByTimeAsync(200);
+      await expect(session.execute(textTurn("next"))).resolves.toMatchObject({
+        ok: false,
+        error: { code: "sessionBusy" },
+      });
+
+      const messageId = transport.steers[0]?.messageId ?? "";
+      transport.recordSteer(messageId);
+      await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+      transport.startSteer(messageId);
+      transport.event({ type: "segment.started" });
+      transport.delta("Still holding.", "quiescence-answer");
+      transport.finish({ status: "succeeded" });
+      await vi.advanceTimersByTimeAsync(200);
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        outcome: { status: "succeeded" },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+    await session.close();
+  });
+
+  it("settles a held Turn once a written steer ends without a native turn", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 200,
+    });
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    vi.useFakeTimers();
+    try {
+      transport.threadEvent({
+        type: "subagent.settled",
+        nativeSubagentId: "native-agent-1",
+        status: "completed",
+        resultSummary: "Agent finished",
+      });
+      const steered = session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("delegate in background"),
+        input: [{ type: "text", text: "never drained" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const messageId = transport.steers[0]?.messageId ?? "";
+      // The transport stops awaiting it: no `queued` receipt in time, or a terminal state.
+      transport.recordSteer(messageId);
+      await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(transport.idleLive).toBe(true);
+
+      transport.releaseSteer(messageId);
+      await vi.advanceTimersByTimeAsync(200);
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        outcome: { status: "succeeded" },
+      });
+      expect(transport.idleLive).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+    await session.close();
+  });
+
+  it("keeps cancellation pending until an undrained steer is released", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 10,
+    });
+    try {
+      transport.finish({ status: "succeeded" });
+      await nextEvent(iterator);
+      transport.threadEvent({
+        type: "subagent.settled",
+        nativeSubagentId: "native-agent-1",
+        status: "completed",
+        resultSummary: "Agent finished",
+      });
+      const steered = session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("delegate in background"),
+        input: [{ type: "text", text: "then cancel" }],
+      });
+      await vi.waitFor(() => expect(transport.steers).toHaveLength(1));
+      const messageId = transport.steers[0]?.messageId ?? "";
+      transport.recordSteer(messageId);
+      await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+
+      await expect(
+        session.execute({
+          type: "turn.cancel",
+          turnId: hostTurnIdSchema.parse("delegate in background"),
+        }),
+      ).resolves.toEqual({ ok: true, value: { cancellationRequested: true } });
+      transport.releaseSteer(messageId);
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        outcome: { status: "cancelled" },
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
+  it("closes a cancellation that waits for a steer which never takes over", async () => {
+    const { adapter, iterator, session, transport } = await holdForUndrainedSteer({
+      continuationQuiescenceMs: 10,
+      cancelTimeoutMs: 1_000,
+    });
+    try {
+      vi.useFakeTimers();
+      await expect(session.execute(cancelDelegationFor("pending-steer"))).resolves.toEqual({
+        ok: true,
+        value: { cancellationRequested: true },
+      });
+      await vi.advanceTimersByTimeAsync(1_000);
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(transport.close).toHaveBeenCalledOnce();
+      expect(outputs.some((event) => event.type === "turn.autonomous.started")).toBe(false);
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: "pending-steer",
+        outcome: { status: "cancelled" },
+      });
+    } finally {
+      vi.useRealTimers();
+      await session.close();
+      await adapter.close();
+    }
+  });
+
+  it("interrupts a pending steer that starts after cancellation begins", async () => {
+    const { adapter, iterator, messageId, session, transport } = await holdForUndrainedSteer({
+      continuationQuiescenceMs: 10,
+    });
+    try {
+      await expect(session.execute(cancelDelegationFor("pending-steer"))).resolves.toEqual({
+        ok: true,
+        value: { cancellationRequested: true },
+      });
+      transport.startSteer(messageId);
+      await vi.waitFor(() => expect(transport.abortContinuation).toHaveBeenCalledOnce());
+      transport.event({ type: "segment.started" });
+      transport.finish({ status: "cancelled", reason: "aborted_streaming" });
+
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(outputs.filter((event) => event.type === "turn.started")).toHaveLength(1);
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: "pending-steer",
+        outcome: { status: "cancelled" },
+      });
+    } finally {
+      await session.close();
+      await adapter.close();
+    }
+  });
+
+  it("keeps the cancellation escalation when an undrained steer ends while a started steer owes its result", async () => {
+    const { adapter, iterator, messageId, session, transport } = await holdForUndrainedSteer({
+      continuationQuiescenceMs: 10,
+      cancelTimeoutMs: 1_000,
+    });
+    try {
+      vi.useFakeTimers();
+      const secondSteer = session.execute({
+        type: "turn.steer",
+        turnId: hostTurnIdSchema.parse("pending-steer"),
+        input: [{ type: "text", text: "cancel instead" }],
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(transport.steers).toHaveLength(2);
+      const secondMessageId = transport.steers[1]?.messageId ?? "";
+      transport.recordSteer(secondMessageId);
+      await expect(secondSteer).resolves.toEqual({ ok: true, value: { accepted: true } });
+      // The first steer is drained into a native turn that still owes its result.
+      transport.startSteer(messageId);
+
+      await expect(session.execute(cancelDelegationFor("pending-steer"))).resolves.toEqual({
+        ok: true,
+        value: { cancellationRequested: true },
+      });
+      // The undrained steer ends without a native turn; the started one is still unresolved.
+      transport.releaseSteer(secondMessageId);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(transport.close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(transport.close).toHaveBeenCalledOnce();
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: "pending-steer",
+        outcome: { status: "cancelled" },
+      });
+    } finally {
+      vi.useRealTimers();
+      await session.close();
+      await adapter.close();
+    }
+  });
+
+  it("clears the cancellation escalation when its last undrained steer is released before the deadline", async () => {
+    const { adapter, iterator, messageId, session, transport } = await holdForUndrainedSteer({
+      continuationQuiescenceMs: 200,
+      cancelTimeoutMs: 1_000,
+    });
+    try {
+      vi.useFakeTimers();
+      await expect(session.execute(cancelDelegationFor("pending-steer"))).resolves.toEqual({
+        ok: true,
+        value: { cancellationRequested: true },
+      });
+      await vi.advanceTimersByTimeAsync(990);
+      transport.releaseSteer(messageId);
+      // Past the original escalation deadline the transport stays open.
+      await vi.advanceTimersByTimeAsync(20);
+      expect(transport.close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(transport.close).not.toHaveBeenCalled();
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: "pending-steer",
+        outcome: { status: "cancelled" },
+      });
+    } finally {
+      vi.useRealTimers();
+      await session.close();
+      await adapter.close();
+    }
+  });
+
+  it("fails a held Turn when its transport faults before releasing a pending steer", async () => {
+    const { adapter, dependencies } = fixture({ continuationQuiescenceMs: 10 });
+    const fakeQuery = new FakeQuery();
+    let transport: ClaudeSdkTransport | undefined;
+    dependencies.createTransport = (input) => {
+      transport = new ClaudeSdkTransport({
+        ...input,
+        command: process.execPath,
+        closeTimeoutMs: 50,
+        steerQueuedTimeoutMs: 60_000,
+        queryFactory: () => fakeQuery as unknown as Query,
+      });
+      return transport;
+    };
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    try {
+      await session.execute(textTurn("faulted-steer"));
+      if (!transport) throw new Error("Claude SDK transport was not created");
+      fakeQuery.push({
+        type: "system",
+        subtype: "init",
+        capabilities: ["msg_lifecycle_v1"],
+      } as unknown as SDKMessage);
+      await vi.waitFor(() => expect(transport?.supportsNativeSteer()).toBe(true));
+      fakeQuery.push({
+        type: "assistant",
+        parent_tool_use_id: null,
+        message: {
+          role: "assistant",
+          content: [
+            { type: "tool_use", id: "toolu_root", name: "Bash", input: { command: "sleep 1" } },
+          ],
+        },
+      } as unknown as SDKMessage);
+      await vi.waitFor(() => expect(transport?.canSteerActiveTurn()).toBe(true));
+      const steered = session
+        .execute({
+          type: "turn.steer",
+          turnId: hostTurnIdSchema.parse("faulted-steer"),
+          input: [{ type: "text", text: "wait for me" }],
+        })
+        .catch(() => undefined);
+
+      fakeQuery.push({
+        type: "user",
+        uuid: "00000000-0000-4000-8000-000000000072",
+        session_id: "00000000-0000-4000-8000-000000000001",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_root", content: "done" }],
+        },
+      } as unknown as SDKMessage);
+      await vi.waitFor(() => expect(transport?.canSteerActiveTurn()).toBe(false));
+      fakeQuery.push({
+        type: "result",
+        subtype: "success",
+        is_error: false,
+        terminal_reason: "completed",
+      } as unknown as SDKMessage);
+      await nextOutputMatching(
+        iterator,
+        (output) =>
+          output.kind === "event" &&
+          output.event.type === "item.completed" &&
+          output.event.snapshot.item.type === "agentMessage",
+      );
+
+      fakeQuery.close();
+      await steered;
+      const outputs = eventOutputs(
+        await nextOutputMatching(
+          iterator,
+          (output) => output.kind === "event" && output.event.type === "turn.completed",
+        ),
+      );
+      expect(outputs.at(-1)).toMatchObject({
+        type: "turn.completed",
+        turnId: "faulted-steer",
+        outcome: { status: "failed" },
+      });
+    } finally {
+      await session.close();
+      await adapter.close();
+    }
+  });
+
+  function cancelDelegationFor(turnId: string) {
+    return { type: "turn.cancel" as const, turnId: hostTurnIdSchema.parse(turnId) };
+  }
+
+  it("does not leave a held Turn waiting on an undrained steer when the Session closes", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent();
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    const steered = session.execute({
+      type: "turn.steer",
+      turnId: hostTurnIdSchema.parse("delegate in background"),
+      input: [{ type: "text", text: "then close" }],
+    });
+    await vi.waitFor(() => expect(transport.steers).toHaveLength(1));
+    transport.recordSteer(transport.steers[0]?.messageId ?? "");
+    await expect(steered).resolves.toEqual({ ok: true, value: { accepted: true } });
+
+    await session.close();
+    const outputs: HarnessOutput[] = [];
+    for (;;) {
+      const output = await iterator.next();
+      if (output.done) break;
+      outputs.push(output.value);
+    }
+    expect(eventOutputs(outputs).at(-1)).toMatchObject({ type: "turn.completed" });
+  });
+
+  function agentApproval(transport: FakeClaudeTransport, requestId: string): void {
+    transport.event({
+      type: "interaction.requested",
+      request: { type: "approval", requestId, title: "Inspect implementation: Bash" },
+      agentScoped: true,
+    });
+  }
+
+  async function lateResponse(session: HarnessSession, interactionId: HostInteractionId) {
+    return session.execute({
+      type: "interaction.respond",
+      interactionId,
+      response: { type: "approval", actionId: "allowOnce" },
+    });
+  }
+
+  it("answers a foreground Agent approval and closes a pending one when the Turn ends", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("delegate in foreground"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.event({
+      type: "subagent.started",
+      operation: "spawn",
+      callId: "agent-1",
+      description: "Inspect implementation",
+      background: false,
+    });
+    await nextEvent(iterator);
+
+    agentApproval(transport, "agent-approval-1");
+    const answered = await nextInteraction(iterator);
+    await expect(lateResponse(session, answered.interactionId)).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(transport.respondToInteraction).toHaveBeenLastCalledWith({
+      type: "approval",
+      requestId: "agent-approval-1",
+      decision: "allowOnce",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "interaction.closed",
+      interactionId: answered.interactionId,
+      reason: "responded",
+    });
+
+    agentApproval(transport, "agent-approval-2");
+    const pending = await nextInteraction(iterator);
+    transport.event({
+      type: "subagent.completed",
+      callId: "agent-1",
+      isError: false,
+      nativeSubagentId: "native-agent-1",
+      resultSummary: "Inspected",
+    });
+    transport.finish({ status: "succeeded" });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    // Without background work the Turn is not held, so the agent approval closes with it.
+    expect(outputs).toContainEqual(
+      expect.objectContaining({
+        type: "interaction.closed",
+        interactionId: pending.interactionId,
+        reason: "superseded",
+      }),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
+    expect(transport.idleLive).toBe(false);
+    await expect(lateResponse(session, pending.interactionId)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalidState" },
+    });
+    expect(transport.respondToInteraction).toHaveBeenCalledOnce();
+    await session.close();
+  });
+
+  it("keeps a background Agent approval answerable while the Turn is held", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent();
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    expect(transport.idleLive).toBe(true);
+
+    agentApproval(transport, "agent-approval");
+    const interaction = await nextInteraction(iterator);
+    await expect(lateResponse(session, interaction.interactionId)).resolves.toMatchObject({
+      ok: true,
+    });
+    expect(transport.respondToInteraction).toHaveBeenLastCalledWith({
+      type: "approval",
+      requestId: "agent-approval",
+      decision: "allowOnce",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "interaction.closed",
+      interactionId: interaction.interactionId,
+      reason: "responded",
+    });
+    await session.close();
+  });
+
+  it("closes a pending agent approval when a held Turn is cancelled", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 10,
+    });
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    agentApproval(transport, "agent-approval");
+    const interaction = await nextInteraction(iterator);
+
+    await session.execute(cancelDelegation);
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs).toContainEqual(
+      expect.objectContaining({
+        type: "interaction.closed",
+        interactionId: interaction.interactionId,
+        reason: "cancelled",
+      }),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+    // The held Turn is over, so the native callback is denied and a late answer is rejected.
+    expect(transport.idleLive).toBe(false);
+    await expect(lateResponse(session, interaction.interactionId)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalidState" },
+    });
+    expect(transport.respondToInteraction).not.toHaveBeenCalled();
+    await session.close();
+  });
+
+  it("closes a pending agent approval when the user cancels during the Root answer", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 10,
+    });
+    agentApproval(transport, "agent-approval");
+    const interaction = await nextInteraction(iterator);
+
+    await session.execute(cancelDelegation);
+    transport.finish({ status: "cancelled", reason: "aborted_streaming" });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs).toContainEqual(
+      expect.objectContaining({
+        type: "interaction.closed",
+        interactionId: interaction.interactionId,
+        reason: "cancelled",
+      }),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+    await expect(lateResponse(session, interaction.interactionId)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "invalidState" },
+    });
+    await session.close();
+  });
+
+  it("closes a pending agent approval when Claude Code disconnects during a held Turn", async () => {
+    const { adapter, transports, dependencies } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("delegate in background"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.event({
+      type: "subagent.started",
+      operation: "spawn",
+      callId: "agent-1",
+      description: "Inspect implementation",
+      background: true,
+    });
+    transport.event({
+      type: "subagent.completed",
+      callId: "agent-1",
+      isError: false,
+      continuesInBackground: true,
+      nativeSubagentId: "native-agent-1",
+      resultSummary: "Async agent launched successfully",
+    });
+    transport.finish({ status: "succeeded" });
+    await vi.waitFor(() => expect(transport.idleLive).toBe(true));
+    agentApproval(transport, "agent-approval");
+    const interaction = (
+      await nextOutputMatching(iterator, (output) => output.kind === "interaction")
+    ).at(-1);
+    if (interaction?.kind !== "interaction") throw new Error("Expected the agent approval");
+
+    // The native process exits: the Transport reports a fault.
+    const input = vi.mocked(dependencies.createTransport).mock.calls[0]?.[0];
+    input?.onFault(new Error("Claude Code exited"));
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs).toContainEqual(
+      expect.objectContaining({
+        type: "interaction.closed",
+        interactionId: interaction.interaction.interactionId,
+        reason: "cancelled",
+      }),
+    );
+    expect(outputs.at(-1)).toMatchObject({ type: "turn.completed", outcome: { status: "failed" } });
+    await expect(
+      lateResponse(session, interaction.interaction.interactionId),
+    ).resolves.toMatchObject({ ok: false });
+    expect(transport.respondToInteraction).not.toHaveBeenCalled();
+    await session.close();
+  });
+
+  it("still fails an unproven interruption after stopping background Subagents", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 10,
+    });
+
+    await session.execute(cancelDelegation);
+    expect(transport.stopTasks).toHaveBeenCalledWith(["native-agent-1"]);
+    transport.finish({ status: "failed", kind: "cancellationUnproven" });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs.at(-1)).toMatchObject({ type: "turn.completed", outcome: { status: "failed" } });
+    await session.close();
+  });
+
+  it("stops background Subagents when the user cancels during the Root answer", async () => {
+    const { iterator, session, transport } = await holdForBackgroundAgent({
+      continuationQuiescenceMs: 300,
+    });
+
+    await expect(session.execute(cancelDelegation)).resolves.toEqual({
+      ok: true,
+      value: { cancellationRequested: true },
+    });
+    expect(transport.stopTasks).toHaveBeenCalledWith(["native-agent-1"]);
+    expect(transport.abortContinuation).toHaveBeenCalledOnce();
+    // The interrupted Root result does not end the Turn before Claude Code goes quiet.
+    transport.finish({ status: "cancelled", reason: "aborted_streaming" });
+    await vi.waitFor(() => expect(transport.idleLive).toBe(true));
+
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs).toContainEqual(
+      expect.objectContaining({
+        type: "subagent.state.changed",
+        nativeSubagentId: "native-agent-1",
+        status: "interrupted",
+      }),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+    expect(transport.idleLive).toBe(false);
     await session.close();
   });
 
@@ -2770,7 +4322,7 @@ describe("Claude Code HarnessAdapter", () => {
                 turnId: hostTurnIdSchema.parse("racing-request"),
                 commandId: "claude.compact",
               });
-        handler.start("racing-continuation");
+        handler.start("racing-continuation", "racing-continuation");
         await expect(admission).resolves.toMatchObject({
           ok: false,
           error: { code: "sessionBusy", retryable: true },
@@ -2824,7 +4376,7 @@ describe("Claude Code HarnessAdapter", () => {
       const transport = transports[0];
       const handler = transport?.autonomousTurnHandler;
       if (!transport || !handler) throw new Error("Fake Claude transport was not created");
-      handler.start("stray-segment");
+      handler.start("stray-segment", "stray-segment");
       handler.onEvent({ type: "text.delta", messageId: "stray-assistant", delta: "STRAY" });
       handler.onTerminal({ status: "succeeded" });
       transport.delta("OWN");
@@ -3630,6 +5182,70 @@ describe("Claude Code HarnessAdapter", () => {
     await session.close();
   });
 
+  it("holds the Root Turn for an Agent that Claude runs asynchronously without run_in_background", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("launch default async agent"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.event({
+      type: "subagent.started",
+      operation: "spawn",
+      callId: "call_default_async",
+      description: "Explore",
+      background: false,
+    });
+    await nextEvent(iterator);
+    transport.event({
+      type: "subagent.completed",
+      callId: "call_default_async",
+      isError: false,
+      continuesInBackground: true,
+      nativeSubagentId: "native-default-async",
+      resultSummary: "Async agent launched successfully",
+    });
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    transport.delta("started", "root-1");
+    await nextEvent(iterator);
+    transport.event({ type: "message.completed", messageId: "root-1", checkpointId: "root-1" });
+    await nextEvent(iterator);
+    transport.finish({ status: "succeeded" });
+    await expect(session.execute(textTurn("follow-up"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "sessionBusy" },
+    });
+
+    transport.event({
+      type: "subagent.settled",
+      nativeSubagentId: "native-default-async",
+      callId: "call_default_async",
+      status: "completed",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "subagent.state.changed",
+      nativeSubagentId: "native-default-async",
+      status: "completed",
+    });
+    transport.delta("report", "root-2");
+    expect(await nextEvent(iterator)).toMatchObject({ type: "item.started" });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "item.updated" });
+    transport.event({ type: "message.completed", messageId: "root-2", checkpointId: "root-2" });
+    expect(await nextEvent(iterator)).toMatchObject({ type: "item.completed" });
+    transport.finish({ status: "succeeded" });
+    // The continuation stays on the requested Turn, so its Fork Checkpoint is the report.
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded", checkpoint: { checkpointId: "root-2" } },
+    });
+    await session.close();
+  });
+
   it("emits a reliable File Change immediately after a successful Edit", async () => {
     const { adapter, transports } = fixture();
     const session = await openSession(adapter);
@@ -4043,7 +5659,9 @@ describe("Claude Code HarnessAdapter", () => {
     const sandboxed = { IS_SANDBOX: "1" };
     const session = await openSession(available.adapter, sandboxed);
     await session.execute(textTurn("bypass-prerequisite"));
-    expect(available.dependencies.bypassPermissionsAvailable).toHaveBeenCalledWith(sandboxed);
+    expect(available.dependencies.bypassPermissionsAvailable).toHaveBeenCalledWith(
+      expect.objectContaining(sandboxed),
+    );
     expect(available.dependencies.createTransport).toHaveBeenCalledWith(
       expect.objectContaining({ allowDangerouslySkipPermissions: true }),
     );
@@ -4387,8 +6005,8 @@ describe("Claude Code HarnessAdapter", () => {
       type: "usage.result",
       totalCostUsd: 1.373,
       modelUsage: [
-        { inputTokens: 100, outputTokens: 40 },
-        { inputTokens: 20, outputTokens: 5 },
+        { model: "claude-sonnet-4-6", inputTokens: 100, outputTokens: 40 },
+        { model: "claude-haiku-4-5", inputTokens: 20, outputTokens: 5 },
       ],
       lastRequestUsage: {
         inputTokens: 10,
@@ -4406,6 +6024,65 @@ describe("Claude Code HarnessAdapter", () => {
         outputTokens: 45,
         cacheHitRatePercent: 99,
       },
+    });
+    transport.finish({ status: "succeeded" });
+    for (;;) {
+      if ((await nextEvent(iterator)).type === "turn.completed") break;
+    }
+    expect(transport.getContextUsage).not.toHaveBeenCalled();
+    await session.close();
+  });
+
+  it("projects Context from the Result's context window without an exact refresh", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+
+    await session.execute(textTurn("result-context"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+
+    transport.event({
+      type: "message.completed",
+      messageId: "assistant-1",
+      lastRequestUsage: {
+        requestId: "request-1",
+        model: "claude-sonnet-4-6",
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheCreationInputTokens: 20,
+        cacheReadInputTokens: 70_000,
+      },
+    });
+    const estimate = await nextEvent(iterator);
+    expect(estimate).toMatchObject({ type: "session.usage.changed" });
+    expect(estimate).not.toHaveProperty("usage.contextWindowTokens");
+
+    transport.event({
+      type: "usage.result",
+      modelUsage: [
+        {
+          model: "claude-haiku-4-5",
+          inputTokens: 900_000,
+          outputTokens: 1,
+          promptTokens: 900_000,
+          contextWindowTokens: 200_000,
+        },
+        {
+          model: "claude-sonnet-4-6",
+          inputTokens: 10,
+          outputTokens: 5,
+          promptTokens: 70_030,
+          contextWindowTokens: 1_000_000,
+        },
+      ],
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.usage.changed",
+      usage: { contextUsedTokens: 70_030, contextWindowTokens: 1_000_000 },
     });
     transport.finish({ status: "succeeded" });
     for (;;) {
@@ -4664,7 +6341,7 @@ describe("Claude Code HarnessAdapter", () => {
     transport.event({
       type: "usage.result",
       totalCostUsd: 0.5,
-      modelUsage: [{ inputTokens: 10, outputTokens: 2 }],
+      modelUsage: [{ model: "claude-sonnet-4-6", inputTokens: 10, outputTokens: 2 }],
     });
     expect(await nextEvent(iterator)).toEqual({
       type: "session.usage.changed",
@@ -4775,31 +6452,45 @@ describe("Claude Code HarnessAdapter", () => {
     await session.close();
   });
 
-  it("drops a malformed plan-limit observation without touching the latest still-applicable Usage", async () => {
-    const { adapter, transports } = fixture();
-    const session = await openSession(adapter);
-    const iterator = session.outputs[Symbol.asyncIterator]();
+  it.each([
+    { fiveHour: { utilizationPercent: Number.NaN } },
+    { fiveHour: { utilizationPercent: 40, resetsAtUnix: Number.MAX_SAFE_INTEGER } },
+    { sevenDay: { utilizationPercent: 12, resetsAtUnix: Number.MAX_SAFE_INTEGER } },
+  ])(
+    "drops a malformed plan-limit observation without touching the latest still-applicable Usage: %j",
+    async (planLimit) => {
+      const { adapter, transports } = fixture();
+      const session = await openSession(adapter);
+      const iterator = session.outputs[Symbol.asyncIterator]();
 
-    await session.execute(textTurn("plan-malformed"));
-    await nextEvent(iterator);
-    await nextEvent(iterator);
-    await nextEvent(iterator);
-    const transport = transports[0];
-    if (!transport) throw new Error("Fake Claude transport was not created");
+      await session.execute(textTurn("plan-malformed"));
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      await nextEvent(iterator);
+      const transport = transports[0];
+      if (!transport) throw new Error("Fake Claude transport was not created");
 
-    transport.planLimit({ fiveHour: { utilizationPercent: 30 } });
-    expect(await nextEvent(iterator)).toEqual({
-      type: "session.usage.changed",
-      observedForTurnId: "plan-malformed",
-      usage: { planFiveHourUsedPercent: 30 },
-    });
+      transport.planLimit({ fiveHour: { utilizationPercent: 30 } });
+      expect(await nextEvent(iterator)).toEqual({
+        type: "session.usage.changed",
+        observedForTurnId: "plan-malformed",
+        usage: { planFiveHourUsedPercent: 30 },
+      });
 
-    transport.planLimit({ fiveHour: { utilizationPercent: Number.NaN } });
-    transport.finish({ status: "succeeded" });
-    expect((await nextEvent(iterator)).type).toBe("item.completed");
-    expect((await nextEvent(iterator)).type).toBe("turn.completed");
-    await session.close();
-  });
+      expect(() => transport.planLimit(planLimit)).not.toThrow();
+      expect(adapter.credits()).toEqual({ usedPercent: 30, periodType: "five_hour" });
+      transport.planLimit({ sevenDay: { utilizationPercent: 12 } });
+      expect(await nextEvent(iterator)).toEqual({
+        type: "session.usage.changed",
+        observedForTurnId: "plan-malformed",
+        usage: { planFiveHourUsedPercent: 30, planSevenDayUsedPercent: 12 },
+      });
+      transport.finish({ status: "succeeded" });
+      expect((await nextEvent(iterator)).type).toBe("item.completed");
+      expect((await nextEvent(iterator)).type).toBe("turn.completed");
+      await session.close();
+    },
+  );
 
   it("has no plan usage on the Adapter before any rate-limit event is observed", () => {
     const { adapter } = fixture();
@@ -4831,6 +6522,7 @@ describe("Claude Code HarnessAdapter", () => {
       productUsage: [
         {
           product: "7-day window",
+          periodType: "seven_day",
           usagePercent: 18,
           resetsAt: new Date(1_756_648_800 * 1000).toISOString(),
         },
@@ -5733,12 +7425,14 @@ describe("Claude Code HarnessAdapter", () => {
       readSubagentMessages: async () => [],
       createTransport: () => ({
         sessionId: "claude-id",
+        steer: async () => undefined,
         setAutonomousTurnHandler: () => undefined,
         setIdleTurnHandler: () => undefined,
         setThreadEventHandler: () => undefined,
         setIdleLive: () => undefined,
         hasBackgroundTasks: () => false,
         stopBackgroundTask: async () => undefined,
+        stopTasks: async () => undefined,
         start: async () => {
           throw new ClaudeCodeExecutableError("Claude Code is not installed");
         },
@@ -5753,6 +7447,7 @@ describe("Claude Code HarnessAdapter", () => {
         runTurn: async () => ({ status: "succeeded" }),
         respondToInteraction: async () => undefined,
         abort: async () => undefined,
+        abortContinuation: async () => undefined,
         close: async () => undefined,
       }),
     };
@@ -5810,5 +7505,355 @@ describe("Claude Code HarnessAdapter", () => {
       undefined,
       undefined,
     ]);
+  });
+});
+
+async function nextOutputMatching(
+  iterator: AsyncIterator<HarnessOutput>,
+  predicate: (output: HarnessOutput) => boolean,
+): Promise<HarnessOutput[]> {
+  const outputs: HarnessOutput[] = [];
+  for (;;) {
+    const output = await iterator.next();
+    if (output.done) throw new Error("Harness output ended unexpectedly");
+    outputs.push(output.value);
+    if (predicate(output.value)) return outputs;
+  }
+}
+
+const eventOutputs = (outputs: HarnessOutput[]) =>
+  outputs.flatMap((output) => (output.kind === "event" ? [output.event] : []));
+
+describe("Claude Code Ultracode selection", () => {
+  const ultracode = harnessThinkingOptionIdSchema.parse("ultracode");
+
+  it("aborts the message and keeps Ultracode selected when Claude Code rejects it at startup", async () => {
+    const { adapter, dependencies, transports } = fixture();
+    const createTransport = dependencies.createTransport;
+    vi.mocked(createTransport).mockImplementation((input) => {
+      const transport = new FakeClaudeTransport(
+        input.sessionId,
+        input.permissionMode,
+        input.onPermissionModeChanged,
+        input.onPlanLimit,
+      );
+      transport.start.mockRejectedValueOnce(
+        new ClaudeUltracodeUnavailableError("workflowsDisabled"),
+      );
+      transports.push(transport);
+      return transport;
+    });
+    const session = await openSession(adapter);
+    await expect(
+      session.execute({ type: "thinking.select", thinkingOptionId: ultracode }),
+    ).resolves.toEqual({ ok: true, value: { completed: true } });
+
+    for (const turn of ["first", "second"]) {
+      await expect(session.execute(textTurn(turn))).resolves.toEqual({
+        ok: false,
+        error: {
+          code: "configurationRequired",
+          message: expect.stringContaining("Dynamic workflows"),
+          retryable: true,
+        },
+      });
+    }
+    expect(vi.mocked(createTransport).mock.calls.map(([input]) => input.thinkingOptionId)).toEqual([
+      ultracode,
+      ultracode,
+    ]);
+    expect(transports.every((transport) => transport.turns.length === 0)).toBe(true);
+    await session.close();
+  });
+
+  it("keeps the confirmed option when a live switch to Ultracode is rejected", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("start"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.finish({ status: "succeeded" });
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+
+    transport.setThinkingOption.mockRejectedValueOnce(
+      new ClaudeUltracodeUnavailableError("unsupportedVersion"),
+    );
+    await expect(
+      session.execute({ type: "thinking.select", thinkingOptionId: ultracode }),
+    ).resolves.toEqual({
+      ok: false,
+      error: {
+        code: "unsupported",
+        message: expect.stringContaining("2.1.154"),
+        retryable: false,
+      },
+    });
+    transport.setModel.mockRejectedValueOnce(
+      new ClaudeUltracodeUnavailableError("modelUnsupported"),
+    );
+    await expect(
+      session.execute({ type: "model.select", model: encodeClaudeModelRef("haiku") }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "unsupported" } });
+    await expect(
+      session.execute({
+        type: "thinking.select",
+        thinkingOptionId: harnessThinkingOptionIdSchema.parse("high"),
+      }),
+    ).resolves.toEqual({ ok: true, value: { completed: true } });
+    // Neither rejected selection was published.
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "session.state.changed",
+      state: { effectiveThinkingOptionId: "high", effectiveModel: CLAUDE_DEFAULT_MODEL_REF },
+    });
+    await session.close();
+  });
+});
+
+describe("Claude Code Workflow runs", () => {
+  async function launchWorkflow(options: ClaudeCodeAdapterOptions = {}) {
+    const { adapter, transports } = fixture(options);
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("run a workflow"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.event({ type: "workflow.started", callId: "workflow-call" });
+    transport.event({
+      type: "workflow.updated",
+      callId: "workflow-call",
+      taskId: "workflow-task",
+      description: "Count lines",
+    });
+    const started = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) =>
+          output.kind === "event" &&
+          output.event.type === "item.started" &&
+          output.event.item.type === "subagentDelegation",
+      ),
+    ).at(-1);
+    expect(started).toMatchObject({
+      type: "item.started",
+      item: {
+        type: "subagentDelegation",
+        operation: "spawn",
+        prompt: "Count lines",
+        subagents: [],
+      },
+    });
+    transport.event({
+      type: "workflow.launched",
+      callId: "workflow-call",
+      isError: false,
+      background: true,
+      taskId: "workflow-task",
+    });
+    transport.event({
+      type: "workflow.updated",
+      callId: "workflow-call",
+      agents: [
+        {
+          index: 1,
+          label: "count:a.txt",
+          state: "running",
+          agentId: "agent-a",
+          phaseTitle: "Count",
+        },
+      ],
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.updated",
+      update: {
+        type: "subagents.replace",
+        subagents: [
+          {
+            subagentId: "workflow-call:1",
+            nativeSubagentId: "agent-a",
+            description: "count:a.txt",
+            role: "Count",
+            status: "running",
+          },
+        ],
+      },
+    });
+    expect(await nextEvent(iterator)).toEqual({
+      type: "subagent.transcript.changed",
+      nativeSubagentId: "agent-a",
+    });
+    return { iterator, session, transport };
+  }
+
+  it("holds the Turn for a launched run and keeps agent approvals answerable", async () => {
+    const { iterator, session, transport } = await launchWorkflow();
+    transport.event({
+      type: "interaction.requested",
+      request: { type: "approval", requestId: "agent-approval", title: "count:a.txt: Bash" },
+      agentScoped: true,
+    });
+    const interaction = await nextInteraction(iterator);
+    expect(interaction).toMatchObject({ type: "approval", title: "count:a.txt: Bash" });
+    transport.delta("The workflow is running", "root-1");
+    transport.event({ type: "message.completed", messageId: "root-1" });
+    transport.finish({ status: "succeeded" });
+    const rootOutputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) =>
+          output.kind === "event" &&
+          output.event.type === "item.completed" &&
+          output.event.snapshot.item.type === "agentMessage",
+      ),
+    );
+    expect(rootOutputs.some(({ type }) => type === "interaction.closed")).toBe(false);
+    await expect(session.execute(textTurn("follow-up"))).resolves.toMatchObject({
+      ok: false,
+      error: { code: "sessionBusy" },
+    });
+
+    // Agent activity during the held Turn refreshes the running agent's transcript.
+    transport.event({ type: "workflow.activity", callId: "workflow-call" });
+    expect(await nextEvent(iterator)).toEqual({
+      type: "subagent.transcript.changed",
+      nativeSubagentId: "agent-a",
+    });
+    await expect(
+      session.execute({
+        type: "interaction.respond",
+        interactionId: interaction.interactionId,
+        response: { type: "approval", actionId: "allowOnce" },
+      }),
+    ).resolves.toMatchObject({ ok: true });
+    expect(transport.respondToInteraction).toHaveBeenLastCalledWith({
+      type: "approval",
+      requestId: "agent-approval",
+      decision: "allowOnce",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "interaction.closed",
+      interactionId: interaction.interactionId,
+      reason: "responded",
+    });
+
+    transport.event({
+      type: "subagent.settled",
+      nativeSubagentId: "workflow-task",
+      callId: "workflow-call",
+      status: "completed",
+      resultSummary: "Count lines",
+    });
+    expect(await nextEvent(iterator)).toMatchObject({
+      type: "item.completed",
+      snapshot: {
+        outcome: { status: "succeeded" },
+        item: {
+          type: "subagentDelegation",
+          subagents: [{ nativeSubagentId: "agent-a", status: "completed" }],
+        },
+      },
+    });
+    expect(await nextEvent(iterator)).toEqual({
+      type: "subagent.transcript.changed",
+      nativeSubagentId: "agent-a",
+    });
+
+    transport.delta("Total: 3 lines", "continuation-1");
+    transport.event({ type: "message.completed", messageId: "continuation-1" });
+    transport.finish({ status: "succeeded" });
+    const completion = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(completion.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "succeeded" },
+    });
+    expect(transport.idleLive).toBe(false);
+    await session.close();
+  });
+
+  it("stops a held run natively when the user cancels the Turn", async () => {
+    const { iterator, session, transport } = await launchWorkflow({
+      continuationQuiescenceMs: 10,
+    });
+    transport.finish({ status: "succeeded" });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+    await expect(
+      session.execute({
+        type: "turn.cancel",
+        turnId: hostTurnIdSchema.parse("run a workflow"),
+      }),
+    ).resolves.toEqual({ ok: true, value: { cancellationRequested: true } });
+    // The stop is confirmed natively before the Turn ends.
+    expect(transport.stopTasks).toHaveBeenCalledWith(["workflow-task"]);
+    expect(transport.abort).not.toHaveBeenCalled();
+    transport.event({
+      type: "subagent.settled",
+      nativeSubagentId: "workflow-task",
+      status: "interrupted",
+    });
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs).toContainEqual(
+      expect.objectContaining({
+        type: "item.completed",
+        snapshot: expect.objectContaining({
+          outcome: { status: "cancelled", reason: "Workflow stopped" },
+          item: expect.objectContaining({
+            type: "subagentDelegation",
+            subagents: [expect.objectContaining({ status: "interrupted" })],
+          }),
+        }),
+      }),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "cancelled" },
+    });
+    await session.close();
+  });
+
+  it("fails a successful Root result that leaves the Workflow tool unanswered", async () => {
+    const { adapter, transports } = fixture();
+    const session = await openSession(adapter);
+    const iterator = session.outputs[Symbol.asyncIterator]();
+    await session.execute(textTurn("broken workflow"));
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    await nextEvent(iterator);
+    const transport = transports[0];
+    if (!transport) throw new Error("Fake Claude transport was not created");
+    transport.event({ type: "workflow.started", callId: "workflow-call" });
+    transport.finish({ status: "succeeded" });
+
+    const outputs = eventOutputs(
+      await nextOutputMatching(
+        iterator,
+        (output) => output.kind === "event" && output.event.type === "turn.completed",
+      ),
+    );
+    expect(outputs.at(-1)).toMatchObject({
+      type: "turn.completed",
+      outcome: { status: "failed", error: { code: "protocolError" } },
+    });
+    expect(outputs.some((event) => event.type === "item.started")).toBe(false);
+    await session.close();
   });
 });
